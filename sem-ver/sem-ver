@@ -542,7 +542,7 @@ _version() {
 }
 
 _cleanup() { 
-  u.debug "Cleanup"
+  u.debug "cleanup"
 }
 ##] functions
 

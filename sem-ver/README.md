@@ -21,10 +21,10 @@ A tool for bumping and comparing version strings according to the Semantic Versi
 ./sem-ver <command> [OPTIONS] [ARGS...]
 
 # Get help
-./sem-ver --help
+./sem-ver -h
 
 # Check version
-./sem-ver --version
+./sem-ver -v
 ```
 
 ## Commands
@@ -80,8 +80,8 @@ A tool for bumping and comparing version strings according to the Semantic Versi
 ## Options
 
 ### Global Options
-- `-h, --help` - Show help message
-- `-v, --version` - Show version information
+- `-h` - Show help message
+- `-v` - Show version information
 
 ### Bump Options
 - `-b <type>` - Bump type: `major`, `minor`, `patch`, `pre`
@@ -175,7 +175,7 @@ fi
 ### From shed repository
 ```bash
 # Use directly
-./sem-ver/sem-ver --help
+./sem-ver/sem-ver -h
 
 # Install to PATH
 curl -o /usr/local/bin/sem-ver https://raw.githubusercontent.com/yourusername/shed/main/sem-ver/sem-ver
@@ -187,7 +187,7 @@ chmod +x /usr/local/bin/sem-ver
 # Download and make executable
 curl -O https://raw.githubusercontent.com/yourusername/shed/main/sem-ver/sem-ver
 chmod +x sem-ver
-./sem-ver --help
+./sem-ver -h
 ```
 
 ## Testing

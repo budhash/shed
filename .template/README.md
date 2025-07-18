@@ -16,17 +16,17 @@ A more detailed description of the tool's purpose, what problems it solves, and 
 ./tool-name -f config.txt
 
 # Get help
-./tool-name --help
+./tool-name -h
 
 # Check version
-./tool-name --version
+./tool-name -v
 ```
 
 ## Options
 
-- `-h, --help` - Show help message
-- `-v, --version` - Show version information  
-- `-f, --file FILE` - Process specified file
+- `-h` - Show help message
+- `-v` - Show version information  
+- `-f FILE` - Process specified file
 
 ## Examples
 
@@ -53,7 +53,7 @@ A more detailed description of the tool's purpose, what problems it solves, and 
 ### From shed repository
 ```bash
 # Use directly
-./tool-name/tool-name --help
+./tool-name/tool-name -h
 
 # Install to PATH
 curl -o /usr/local/bin/tool-name https://raw.githubusercontent.com/yourusername/shed/main/tool-name/tool-name
@@ -65,7 +65,7 @@ chmod +x /usr/local/bin/tool-name
 # Download and make executable
 curl -O https://raw.githubusercontent.com/yourusername/shed/main/tool-name/tool-name
 chmod +x tool-name
-./tool-name --help
+./tool-name -h
 ```
 
 ## Testing
@@ -90,7 +90,3 @@ Available assertions: `assert_eq`, `assert_ok`, `assert_fail`, `assert_contains`
 ## License
 
 [MIT](../LICENSE) - see repository root for details.
-
-## Contributing
-
-This tool is part of the [shed](../) collection. See the main repository for contributing guidelines.
