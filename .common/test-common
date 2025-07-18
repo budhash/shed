@@ -18,15 +18,19 @@ _FAILURES=0
 _RST=$'\033[0m' _GRN=$'\033[0;32m' _RED=$'\033[0;31m' _YLW=$'\033[1;33m' _BLU=$'\033[0;34m'
 [[ -n "${NO_COLOR:-}" ]] && _RST='' _GRN='' _RED='' _YLW='' _BLU=''
 
-# Tool info (auto-detected)
-TOOL_NAME=${TOOL_NAME:-$(basename "$(pwd)")}
-TOOL_SCRIPT=${TOOL_SCRIPT:-"./$TOOL_NAME"}
+# Tool info (auto-detected, prefer shorter names)
+NAME=${NAME:-${TOOL_NAME:-$(basename "$(pwd)")}}
+TOOL=${TOOL:-${TOOL_SCRIPT:-"./$NAME"}}
+
+# Backward compatibility
+TOOL_NAME="$NAME"
+TOOL_SCRIPT="$TOOL"
 ##) globals
 
 ##( test framework
 # Main test runner - call this from your tests.sh
 test_runner() {
-  echo "Running Test Suite for $TOOL_NAME..."
+  echo "Running Test Suite for $NAME..."
   echo
   
   # Run standard tests first
@@ -165,29 +169,29 @@ _test_standard_functionality() {
   test_section "Standard Functionality"
   
   # Test if the main script exists and is executable
-  assert_file_exists "$TOOL_SCRIPT" "script file exists"
-  assert_ok test -x "$TOOL_SCRIPT" "script is executable"
+  assert_file_exists "$TOOL" "script file exists"
+  assert_ok test -x "$TOOL" "script is executable"
   
   # Test help flag (try short flag first, then long flag)
-  if $TOOL_SCRIPT -h >/dev/null 2>&1; then
-    assert_ok $TOOL_SCRIPT -h "short help flag works"
+  if $TOOL -h >/dev/null 2>&1; then
+    assert_ok $TOOL -h "short help flag works"
   fi
   
-  if $TOOL_SCRIPT --help >/dev/null 2>&1; then
-    assert_ok $TOOL_SCRIPT --help "long help flag works"
+  if $TOOL --help >/dev/null 2>&1; then
+    assert_ok $TOOL --help "long help flag works"
   fi
   
   # Test version flag (try short flag first, then long flag)  
-  if $TOOL_SCRIPT -v >/dev/null 2>&1; then
-    assert_ok $TOOL_SCRIPT -v "short version flag works"
+  if $TOOL -v >/dev/null 2>&1; then
+    assert_ok $TOOL -v "short version flag works"
   fi
   
-  if $TOOL_SCRIPT --version >/dev/null 2>&1; then
-    assert_ok $TOOL_SCRIPT --version "long version flag works"
+  if $TOOL --version >/dev/null 2>&1; then
+    assert_ok $TOOL --version "long version flag works"
   fi
   
   # Test invalid option fails gracefully
-  assert_fail $TOOL_SCRIPT --invalid-option "invalid option fails gracefully"
+  assert_fail $TOOL --invalid-option "invalid option fails gracefully"
   
   echo
 }
@@ -196,12 +200,12 @@ _test_standard_functionality() {
 ##( helper functions
 # Create a temporary directory for testing
 make_temp_dir() {
-  mktemp -d "${TMPDIR:-/tmp}/shed-test-${TOOL_NAME}-XXXXXX"
+  mktemp -d "${TMPDIR:-/tmp}/shed-test-${NAME}-XXXXXX"
 }
 
 # Create a temporary file for testing
 make_temp_file() {
-  mktemp "${TMPDIR:-/tmp}/shed-test-${TOOL_NAME}-XXXXXX"
+  mktemp "${TMPDIR:-/tmp}/shed-test-${NAME}-XXXXXX"
 }
 
 # Cleanup function for temp files
