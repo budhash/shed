@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+##( header
 # --------------------------------------------------------------------
 # sem-ver - Semantic version bumping and management
 # 
@@ -10,21 +11,16 @@
 # VERSION: 1.0.0
 # LICENSE: MIT
 # --------------------------------------------------------------------
+##) header
 
 ##( configuration
 set -eEuo pipefail; IFS=$'\n\t'  # fail fast, secure IFS
 ##) configuration
 
 ##( metadata
-readonly __NAME=sem-ver
 readonly __APP="$(basename "${BASH_SOURCE[0]:-}")"
 __DBG=${DEBUG:-false}
 ##) metadata
-
-##( dependencies
-readonly __OS=(mac linux)
-readonly __DEPS=(cut sort)
-##) dependencies
 
 ##( globals
 
@@ -67,6 +63,8 @@ u.debug() { u.log -l "debug" "$@"; }
 ##( app
 
 ##[ config
+readonly __NAME=template
+readonly __OS=(mac linux)
 readonly __APP_DEPS=(cut sort)
 ##] config
 
@@ -79,17 +77,20 @@ readonly SEMVER_PATTERN='^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z-]+(\.[0-9A-Za
 _validate_bump_args() {
   local bump_type="$1" version="$2" pre_release_id="$3"
   
-  [[ "$bump_type" =~ ^(major|minor|patch|pre)$ ]] || {
-    u.error "Invalid bump type '$bump_type'. Must be major, minor, patch, or pre"
-    return 1
-  }
+  # Validate bump type
+  case "$bump_type" in
+    major|minor|patch|pre) ;;
+    *) u.error "Invalid bump type '$bump_type'. Must be major, minor, patch, or pre"; return 1 ;;
+  esac
   
+  # Validate version format
   _is_valid_semver "$version" || return 1
   
-  [[ "$bump_type" == "pre" && -z "$pre_release_id" ]] && {
+  # Validate pre-release requirement
+  if [[ "$bump_type" == "pre" && -z "$pre_release_id" ]]; then
     u.error "Pre-release identifier (-p) is required when using 'pre' bump type"
     return 1
-  }
+  fi
   
   return 0
 }
@@ -97,11 +98,13 @@ _validate_bump_args() {
 _validate_compare_args() {
   local operator="$1" v1="$2" v2="$3"
   
-  [[ "$operator" =~ ^(eq|gt|lt)$ ]] || {
-    u.error "Invalid operator '$operator'. Must be eq, gt, or lt"
-    return 1
-  }
+  # Validate operator
+  case "$operator" in
+    eq|gt|lt) ;;
+    *) u.error "Invalid operator '$operator'. Must be eq, gt, or lt"; return 1 ;;
+  esac
   
+  # Validate both versions
   _is_valid_semver "$v1" || return 1
   _is_valid_semver "$v2" || return 1
   
@@ -136,26 +139,14 @@ _main() {
   shift
   
   case "$subcommand" in
-    bump)
-      _bump_version "$@"
-      ;;
-    compare)
-      _compare_versions "$@"
-      ;;
-    validate)
-      _validate_version "$@"
-      ;;
-    parse)
-      _parse_version "$@"
-      ;;
+    bump) _bump_version "$@" ;;
+    compare) _compare_versions "$@" ;;
+    validate) _validate_version "$@" ;;
+    parse) _parse_version "$@" ;;
     # Shorthand comparison operators
-    gt|lt|eq)
-      _compare_versions -c "$subcommand" "$@"
-      ;;
+    gt|lt|eq) _compare_versions -c "$subcommand" "$@" ;;
     # Shorthand bump types
-    major|minor|patch|pre)
-      _bump_version -b "$subcommand" "$@"
-      ;;
+    major|minor|patch|pre) _bump_version -b "$subcommand" "$@" ;;
     *)
       u.error "Unknown subcommand: '$subcommand'"
       _help
@@ -182,49 +173,42 @@ _bump_version() {
   # If no -b flag provided, check if first arg is a bump type
   if [[ -z "$bump_type" && $# -gt 0 ]]; then
     case "$1" in
-      major|minor|patch|pre)
-        bump_type="$1"
-        shift
-        ;;
+      major|minor|patch|pre) bump_type="$1"; shift ;;
     esac
   fi
 
   if [[ -z "$bump_type" ]]; then 
     u.error "Missing bump type. Use -b <type> or specify type directly"
-    _help_bump
-    exit $_E_USG
+    _help_bump; exit $_E_USG
   fi
   
   if [[ $# -ne 1 ]]; then 
     u.error "Missing version argument"
-    _help_bump
-    exit $_E_USG
+    _help_bump; exit $_E_USG
   fi
 
   local version="$1"
   
-  # Validate arguments
-  _validate_bump_args "$bump_type" "$version" "$pre_release_id" || exit $_E_USG
+  # Single validation call instead of separate function
+  if ! _validate_bump_args "$bump_type" "$version" "$pre_release_id"; then
+    exit $_E_USG
+  fi
 
-  local new_version
-  new_version=$(_calculate_bump "$bump_type" "$pre_release_id" "$version")
-  echo "$new_version"
+  _calculate_bump "$bump_type" "$pre_release_id" "$version"
 }
 
 _calculate_bump() {
   local bump_type="$1" pre_release_id="$2" version="$3"
   local core_version="" version_no_build=""
 
-  u.debug "Calculating bump: type='$bump_type', pre_id='$pre_release_id', version='$version'"
+  u.debug "Bump calculation: $bump_type '$version'"
 
   # Strip build metadata first (anything after +)
   version_no_build="${version%%+*}"
-  u.debug "Version without build metadata: '$version_no_build'"
   
   # Extract core version (MAJOR.MINOR.PATCH)
   if [[ "$version_no_build" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
     core_version=${BASH_REMATCH[1]}
-    u.debug "Parsed core version: '$core_version'"
   else
     u.error "Invalid version format: '$version'"
     exit $_E_USG
@@ -234,7 +218,6 @@ _calculate_bump() {
   if [[ "$bump_type" == "pre" ]]; then
     # Workflow: Iterate on an existing pre-release. Core version does not change.
     new_version="$core_version-$pre_release_id"
-    u.debug "Pre-release bump result: '$new_version'"
   else
     # Workflow: Bump core version, optionally add pre-release tag.
     local major minor patch
@@ -242,13 +225,11 @@ _calculate_bump() {
     minor=$(echo "$core_version" | cut -d. -f2)
     patch=$(echo "$core_version" | cut -d. -f3)
 
-    u.debug "Current version components: major=$major, minor=$minor, patch=$patch"
-
     # Check if we're finalizing a pre-release (current version has pre-release, no -p flag)
     if [[ "$version_no_build" =~ ^[0-9]+\.[0-9]+\.[0-9]+- ]] && [[ -z "$pre_release_id" ]]; then
       # We're finalizing - use current core version without incrementing
       new_version="$core_version"
-      u.debug "Finalizing pre-release: '$version_no_build' -> '$new_version'"
+      u.debug "Finalizing pre-release: $version_no_build -> $new_version"
     else
       # Normal bump
       case "$bump_type" in
@@ -257,7 +238,6 @@ _calculate_bump() {
         patch) patch=$((patch + 1)) ;;
       esac
       local bumped_core="$major.$minor.$patch"
-      u.debug "Bumped core version: '$bumped_core'"
 
       if [[ -n "$pre_release_id" ]]; then
         new_version="$bumped_core-$pre_release_id"
@@ -267,7 +247,7 @@ _calculate_bump() {
     fi
   fi
   
-  u.debug "Final bump result: '$new_version'"
+  u.debug "Result: $new_version"
   echo "$new_version"
 }
 
@@ -392,8 +372,6 @@ _version_core_compare() {
   local v1="$1" v2="$2"
   local v1_parts v2_parts
   
-  u.debug "Comparing core versions: '$v1' vs '$v2'"
-  
   IFS='.' read -r -a v1_parts <<< "$v1"
   IFS='.' read -r -a v2_parts <<< "$v2"
   
@@ -405,35 +383,26 @@ _version_core_compare() {
     num2=$(printf '%d' "$n2" 2>/dev/null) || return 1
     
     if (( num1 > num2 )); then 
-      u.debug "Core comparison result: 1 (v1 > v2)"
-      echo "1"
-      return
+      echo "1"; return
     elif (( num1 < num2 )); then 
-      u.debug "Core comparison result: -1 (v1 < v2)"
-      echo "-1"
-      return
+      echo "-1"; return
     fi
   done
   
-  u.debug "Core comparison result: 0 (v1 = v2)"
   echo "0"
 }
 
 _version_compare() {
   local v1="$1" v2="$2"
   
-  u.debug "Comparing versions: '$v1' vs '$v2'"
+  u.debug "Version compare: '$v1' vs '$v2'"
   
   # Strip build metadata (everything after +) as per SemVer spec
   v1="${v1%%+*}"
   v2="${v2%%+*}"
-  u.debug "After stripping build metadata: '$v1' vs '$v2'"
   
   local v1_core="${v1%%-*}" v2_core="${v2%%-*}"
   local v1_pre="${v1#$v1_core}" v2_pre="${v2#$v2_core}"
-
-  u.debug "Core versions: '$v1_core' vs '$v2_core'"
-  u.debug "Pre-release parts: '$v1_pre' vs '$v2_pre'"
 
   local result=0
 
@@ -444,26 +413,23 @@ _version_compare() {
     # Core versions are equal, compare pre-release
     if [[ -z "$v1_pre" ]]; then 
       result=1  # Final release > pre-release
-      u.debug "Final release > pre-release"
     elif [[ -z "$v2_pre" ]]; then 
       result=-1  # Pre-release < final release
-      u.debug "Pre-release < final release"
     else
       # Both have pre-release, compare them
       local v1_pre_clean="${v1_pre:1}" v2_pre_clean="${v2_pre:1}"  # Remove leading dash
-      u.debug "Comparing pre-releases: '$v1_pre_clean' vs '$v2_pre_clean'"
       result=$(_compare_prerelease "$v1_pre_clean" "$v2_pre_clean")
     fi
   fi
 
-  u.debug "Final comparison result: $result"
+  u.debug "Result: $result"
   echo "$result"
 }
 
 _compare_prerelease() {
   local pre1="$1" pre2="$2"
   
-  u.debug "Pre-release comparison: '$pre1' vs '$pre2'"
+  u.debug "Pre-release compare: '$pre1' vs '$pre2'"
   
   IFS='.' read -r -a parts1 <<< "$pre1"
   IFS='.' read -r -a parts2 <<< "$pre2"
@@ -471,17 +437,13 @@ _compare_prerelease() {
   local len1=${#parts1[@]} len2=${#parts2[@]}
   local limit=$(( len1 < len2 ? len1 : len2 ))
   
-  u.debug "Part counts: $len1 vs $len2, comparing first $limit parts"
-  
   for (( i=0; i<limit; i++ )); do
     local p1="${parts1[i]}" p2="${parts2[i]}"
-    u.debug "Comparing part $i: '$p1' vs '$p2'"
-    
-    if [[ "$p1" == "$p2" ]]; then continue; fi
+    [[ "$p1" == "$p2" ]] && continue
     
     local p1_is_num=false p2_is_num=false
-    if [[ "$p1" =~ ^[0-9]+$ ]]; then p1_is_num=true; fi
-    if [[ "$p2" =~ ^[0-9]+$ ]]; then p2_is_num=true; fi
+    [[ "$p1" =~ ^[0-9]+$ ]] && p1_is_num=true
+    [[ "$p2" =~ ^[0-9]+$ ]] && p2_is_num=true
     
     if $p1_is_num && $p2_is_num; then
       # Both numeric, compare numerically using safe parsing
@@ -489,50 +451,23 @@ _compare_prerelease() {
       num1=$(printf '%d' "$p1" 2>/dev/null) || { echo "-1"; return; }
       num2=$(printf '%d' "$p2" 2>/dev/null) || { echo "1"; return; }
       
-      if (( num1 > num2 )); then 
-        u.debug "Numeric comparison: $num1 > $num2"
-        echo "1"
-        return
-      else 
-        u.debug "Numeric comparison: $num1 < $num2"
-        echo "-1"
-        return
-      fi
+      if (( num1 > num2 )); then echo "1"; return
+      else echo "-1"; return; fi
     elif $p1_is_num; then
-      # Numeric has lower precedence than non-numeric
-      u.debug "Numeric < non-numeric"
-      echo "-1"
-      return
+      echo "-1"; return  # Numeric < non-numeric
     elif $p2_is_num; then
-      # Non-numeric has higher precedence than numeric
-      u.debug "Non-numeric > numeric"
-      echo "1"
-      return
+      echo "1"; return   # Non-numeric > numeric
     else
       # Both non-numeric, compare lexically
-      if [[ "$p1" > "$p2" ]]; then 
-        u.debug "Lexical comparison: '$p1' > '$p2'"
-        echo "1"
-        return
-      else 
-        u.debug "Lexical comparison: '$p1' < '$p2'"
-        echo "-1"
-        return
-      fi
+      if [[ "$p1" > "$p2" ]]; then echo "1"; return
+      else echo "-1"; return; fi
     fi
   done
   
-  # All compared parts are equal, longer version wins
-  if (( len1 > len2 )); then
-    u.debug "Longer pre-release wins: $len1 > $len2"
-    echo "1"
-  elif (( len1 < len2 )); then
-    u.debug "Longer pre-release wins: $len2 > $len1"
-    echo "-1"
-  else
-    u.debug "Pre-release parts equal"
-    echo "0"
-  fi
+  # All compared parts equal, longer version wins
+  if (( len1 > len2 )); then echo "1"
+  elif (( len1 < len2 )); then echo "-1"
+  else echo "0"; fi
 }
 
 _help() {

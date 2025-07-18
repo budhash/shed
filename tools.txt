@@ -1,3 +1,4 @@
 # Shed Tools Registry
 # Format: tool-name:description
 .template:Template
+sem-ver:Semantic version bumping and management
