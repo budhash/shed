@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+##( header
+# --------------------------------------------------------------------
+# git-tag - Git tag management with semantic versioning
+# 
+# A tool for managing Git tags based on semantic versioning. Can get the 
+# current tag, bump it using SemVer rules, or set a specific version 
+# after validation. Integrates with sem-ver for version calculations.
+# --------------------------------------------------------------------
+# AUTHOR: Budha <budhash@gmail.com>
+# VERSION: 1.0.0
+# LICENSE: MIT
+# --------------------------------------------------------------------
+##) header
+
+##( configuration
+set -eEuo pipefail; IFS=$'\n\t'  # fail fast, secure IFS
+##) configuration
+
+##( metadata
+readonly __APP="$(basename "${BASH_SOURCE[0]:-}")"
+__DBG=${DEBUG:-false}
+##) metadata
+
+##( globals
+
+##[ colors
+_RST=$'\033[0m' _GRN=$'\033[0;32m' _YLW=$'\033[0;33m' _RED=$'\033[0;31m' _BLU=$'\033[0;34m'
+[[ -n "${NO_COLOR:-}" || ! -t 1 ]] && _RST='' _GRN='' _YLW='' _RED='' _BLU=''
+##] colors
+
+##[ error
+# general failure / bad usage / dependency not found / unsupported OS / not found / permission error / not connected
+readonly _E=1 _E_USG=2 _E_DEP=3 _E_OS=4 _E_NF=5 _E_NP=6 _E_NC=7  
+##] error
+
+##) globals
+
+##( helpers
+
+##[ system
+u.os() { case "${OSTYPE:-}" in darwin*) echo mac;; linux*) echo linux;; *) echo unknown;; esac; }
+u.require() { command -v "${1:-}" >/dev/null || { u.error "missing dependency: ${1:-}"; exit $_E_DEP; }; }
+u.die() { u.error "$@"; exit $_E; }
+##] system
+
+##[ logging
+u.log() {
+  local _l="info " _co="$_GRN"
+  [[ "${1:-}" == "-l" ]] && { _l="${2:-info}"; shift 2; }
+  case "$_l" in warn) _co="$_YLW";; error) _co="$_RED";; debug) _co="$_BLU"; [[ "$__DBG" != true ]] && return;; esac
+  printf "${_co}[%s]${_RST} %s\n" "$_l" "$*" >&2
+  return 0
+}
+u.info() { u.log -l "info " "$@"; }
+u.warn() { u.log -l "warn " "$@"; }
+u.error() { u.log -l "error" "$@"; }
+u.debug() { u.log -l "debug" "$@"; }
+##] logging
+
+##) helpers
+
+##( app
+
+##[ config
+readonly __NAME=git-tag
+readonly __OS=(mac linux)
+readonly __APP_DEPS=(git)
+readonly __SEMVER_TOOL="${SEM_VER:-../sem-ver/sem-ver}"
+##] config
+
+##[ constants
+readonly TAG_PREFIX="v"
+readonly TAG_PATTERN="v*"
+##] constants
+
+##[ validation
+_validate_git_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || { u.error "not in a git repository"; exit $_E_NF; }
+}
+
+_validate_semver_tool() {
+  [[ -x "$__SEMVER_TOOL" ]] || { u.error "sem-ver tool not found at $__SEMVER_TOOL"; exit $_E_DEP; }
+}
+
+_validate_tag_format() {
+  local tag="$1"
+  [[ "$tag" == ${TAG_PREFIX}* ]] || { u.error "invalid tag format: '$tag'. tag must start with '$TAG_PREFIX' (e.g., v1.2.3)"; exit $_E_USG; }
+  
+  # Validate the version part using sem-ver
+  local version="${tag#"$TAG_PREFIX"}"
+  "$__SEMVER_TOOL" validate "$version" >/dev/null 2>&1 || { u.error "invalid version format in tag: '$tag'"; exit $_E_USG; }
+}
+
+_validate_tag_not_exists() {
+  local tag="$1"
+  if git tag -l "$tag" | grep -q "^$tag$"; then
+    u.error "tag '$tag' already exists"
+    exit $_E_USG
+  fi
+  return 0
+}
+
+_validate_tag_greater() {
+  local new_tag="$1" current_tag="$2"
+  "$__SEMVER_TOOL" gt "$new_tag" "$current_tag" >/dev/null 2>&1 || { u.error "new tag '$new_tag' must be greater than current highest tag '$current_tag'"; exit $_E_USG; }
+}
+##] validation
+
+##[ core functions
+_get_current_tag() {
+  u.debug "finding highest semantic version tag"
+  local tags
+  tags=$(git tag -l "$TAG_PATTERN" 2>/dev/null)
+  
+  [[ -z "$tags" ]] && { echo "${TAG_PREFIX}0.0.0"; return; }
+  
+  # Find the highest semantic version tag using sem-ver comparison
+  local highest_tag=""
+  while IFS= read -r tag; do
+    if [[ -z "$highest_tag" ]]; then
+      highest_tag="$tag"
+    else
+      # Strip v prefix for sem-ver comparison
+      local tag_version="${tag#"$TAG_PREFIX"}"
+      local highest_version="${highest_tag#"$TAG_PREFIX"}"
+      
+      # Use sem-ver to compare versions properly
+      if "$__SEMVER_TOOL" gt "$tag_version" "$highest_version" >/dev/null 2>&1; then
+        highest_tag="$tag"
+      fi
+    fi
+  done <<< "$tags"
+  
+  echo "$highest_tag"
+}
+
+_get_latest_chronological_tag() {
+  u.debug "finding most recent chronological tag"
+  local latest_tag
+  latest_tag=$(git tag -l "$TAG_PATTERN" --sort=-creatordate 2>/dev/null | head -n 1)
+  
+  [[ -z "$latest_tag" ]] && echo "${TAG_PREFIX}0.0.0" || echo "$latest_tag"
+}
+
+_fetch_tags() {
+  u.debug "fetching tags from remote"
+  if git remote >/dev/null 2>&1 && [[ $(git remote | wc -l) -gt 0 ]]; then
+    git fetch --tags --quiet 2>/dev/null || u.warn "failed to fetch tags from remote"
+  else
+    u.debug "no remotes configured, using local tags only"
+  fi
+  return 0
+}
+
+_create_tag() {
+  local tag="$1" message="$2"
+  u.info "creating annotated tag '$tag'"
+  git tag -a "$tag" -m "$message"
+  u.info "tag '$tag' created successfully"
+  
+  git remote >/dev/null 2>&1 && [[ $(git remote | wc -l) -gt 0 ]] && u.info "run 'git push origin $tag' to publish the tag"
+  return 0
+}
+##] core functions
+
+##[ commands
+_cmd_current() {
+  [[ $# -eq 0 ]] || { u.error "'current' command takes no arguments"; exit $_E_USG; }
+  _fetch_tags
+  _get_current_tag
+}
+
+_cmd_latest() {
+  [[ $# -eq 0 ]] || { u.error "'latest' command takes no arguments"; exit $_E_USG; }
+  _fetch_tags
+  _get_latest_chronological_tag
+}
+
+_cmd_next() {
+  local bump_type="patch" pre_release_id=""
+  
+  local opt
+  OPTIND=1
+  while getopts ":b:p:" opt; do
+    case $opt in
+      b) bump_type="$OPTARG" ;;
+      p) pre_release_id="$OPTARG" ;;
+      \?) u.error "invalid option for 'next': -$OPTARG"; exit $_E_USG ;;
+      :) u.error "option -$OPTARG requires an argument"; exit $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  
+  [[ $# -eq 0 ]] || { u.error "'next' command takes no additional arguments"; exit $_E_USG; }
+  
+  # Validate bump type (but no other validation - just show calculation)
+  case "$bump_type" in
+    major|minor|patch|pre) ;;
+    *) u.error "invalid bump type: '$bump_type'. must be major, minor, patch, or pre"; exit $_E_USG ;;
+  esac
+  
+  _fetch_tags
+  local current_tag
+  current_tag=$(_get_current_tag)
+  
+  # Calculate next version using sem-ver (pure calculation)
+  local current_version="${current_tag#"$TAG_PREFIX"}"
+  local semver_args=("bump" "-b" "$bump_type")
+  [[ -n "$pre_release_id" ]] && semver_args+=("-p" "$pre_release_id")
+  semver_args+=("$current_version")
+  
+  local new_version
+  new_version=$("$__SEMVER_TOOL" "${semver_args[@]}")
+  echo "${TAG_PREFIX}${new_version}"
+}
+
+_cmd_list() {
+  [[ $# -eq 0 ]] || { u.error "'list' command takes no arguments"; exit $_E_USG; }
+  
+  _fetch_tags
+  local tags
+  tags=$(git tag -l "$TAG_PATTERN" --sort=-creatordate 2>/dev/null)
+  
+  [[ -z "$tags" ]] && { u.info "no tags found"; return 0; }
+  
+  # Show tags with creation date and message in chronological order (newest first)
+  printf "%-20s %-12s %s\n" "TAG" "DATE" "MESSAGE"
+  printf "%-20s %-12s %s\n" "---" "----" "-------"
+  while IFS= read -r tag; do
+    local date message
+    date=$(git tag -l --format='%(creatordate:short)' "$tag" 2>/dev/null)
+    message=$(git tag -l --format='%(subject)' "$tag" 2>/dev/null)
+    printf "%-20s %-12s %s\n" "$tag" "$date" "$message"
+  done <<< "$tags"
+  
+  return 0
+}
+
+_cmd_bump() {
+  local bump_type="patch" pre_release_id="" dry_run=false
+  
+  local opt
+  OPTIND=1
+  while getopts ":b:p:dh" opt; do
+    case $opt in
+      b) bump_type="$OPTARG" ;;
+      p) pre_release_id="$OPTARG" ;;
+      d) dry_run=true ;;
+      h) _help; exit 0 ;;
+      \?) u.error "invalid option for 'bump': -$OPTARG"; _help_bump; exit $_E_USG ;;
+      :) u.error "option -$OPTARG requires an argument"; _help_bump; exit $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  
+  [[ $# -eq 0 ]] || { u.error "'bump' command takes no additional arguments"; exit $_E_USG; }
+  
+  # Validate bump type
+  case "$bump_type" in
+    major|minor|patch|pre) ;;
+    *) u.error "invalid bump type: '$bump_type'. must be major, minor, patch, or pre"; exit $_E_USG ;;
+  esac
+  
+  # Validate pre-release requirement
+  [[ "$bump_type" == "pre" && -z "$pre_release_id" ]] && { u.error "pre-release identifier (-p) is required when using 'pre' bump type"; exit $_E_USG; }
+  
+  _fetch_tags
+  local current_tag
+  current_tag=$(_get_current_tag)
+  u.info "current highest tag: $current_tag"
+  
+  # Calculate new version using sem-ver
+  local current_version="${current_tag#"$TAG_PREFIX"}"
+  local semver_args=("bump" "-b" "$bump_type")
+  [[ -n "$pre_release_id" ]] && semver_args+=("-p" "$pre_release_id")
+  semver_args+=("$current_version")
+  
+  u.debug "running: $__SEMVER_TOOL ${semver_args[*]}"
+  local new_version
+  new_version=$("$__SEMVER_TOOL" "${semver_args[@]}")
+  local new_tag="${TAG_PREFIX}${new_version}"
+  
+  # Only validate tag existence for non-dry-run
+  if [[ "$dry_run" != true ]]; then
+    _validate_tag_not_exists "$new_tag"
+  fi
+  
+  if [[ "$dry_run" == true ]]; then
+    u.info "dry run: would create tag '$new_tag'"
+    echo "$new_tag"
+  else
+    _create_tag "$new_tag" "Release $new_version"
+    echo "$new_tag"
+  fi
+}
+
+_cmd_set() {
+  [[ $# -eq 1 ]] || { u.error "'set' command requires exactly one argument: <tag>"; exit $_E_USG; }
+  
+  local new_tag="$1"
+  
+  # Validate tag format
+  _validate_tag_format "$new_tag"
+  
+  _fetch_tags
+  
+  # Check if tag already exists
+  _validate_tag_not_exists "$new_tag"
+  
+  # Check if new tag is greater than current
+  local current_tag
+  current_tag=$(_get_current_tag)
+  u.info "current highest tag: $current_tag"
+  _validate_tag_greater "$new_tag" "$current_tag"
+  
+  local new_version="${new_tag#"$TAG_PREFIX"}"
+  _create_tag "$new_tag" "Release $new_version"
+  echo "$new_tag"
+}
+##] commands
+
+##[ functions
+_main() {
+  # Tool-specific validations (must be in app section)
+  _validate_git_repo
+  _validate_semver_tool
+  
+  local opt help=false version=false
+  while getopts "hv" opt; do
+    case $opt in
+      h) help=true ;;
+      v) version=true ;;
+      \?) u.error "unknown option: -${OPTARG:-}"; exit $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND-1))
+
+  [[ "$help" == true ]] && { _help; exit 0; }
+  [[ "$version" == true ]] && { _version; exit 0; }
+  
+  # Require a subcommand
+  [[ $# -eq 0 ]] && { u.error "missing command"; _help; exit $_E_USG; }
+  
+  local command="$1"
+  shift
+  
+  case "$command" in
+    current) _cmd_current "$@" ;;
+    latest) _cmd_latest "$@" ;;
+    next) _cmd_next "$@" ;;
+    list) _cmd_list "$@" ;;
+    bump) _cmd_bump "$@" ;;
+    set) _cmd_set "$@" ;;
+    *) u.error "unknown command: '$command'"; _help; exit $_E_USG ;;
+  esac
+}
+
+_help() {
+  cat << EOF
+$(_version) - Git tag management with semantic versioning
+
+USAGE:
+    $__APP <command> [OPTIONS] [ARGS...]
+
+COMMANDS:
+    current                          Get the highest semantic version tag
+    latest                           Get the most recently created tag
+    next [-b <type>] [-p <id>]       Show what the next version would be
+    list                             List all tags chronologically with metadata
+    bump [-b <type>] [-p <id>] [-d]  Bump version and create new tag
+    set <tag>                        Set a specific tag after validation
+
+NEXT/BUMP OPTIONS:
+    -b <type>     Bump type: major, minor, patch, pre (default: patch)
+    -p <id>       Pre-release identifier (e.g., alpha.1, rc.2)
+    -d            Dry run - show what would be created (bump only)
+
+GLOBAL OPTIONS:
+    -h            Show this help
+    -v            Show version
+
+EXAMPLES:
+    # Get version information
+    $__APP current                   # v1.2.3
+    $__APP latest                    # v1.2.0 (most recent)
+    $__APP list                      # show all tags with dates
+    
+    # Preview next versions
+    $__APP next                      # v1.2.4 (next patch)
+    $__APP next -b minor             # v1.3.0 (next minor)
+    $__APP next -b major             # v2.0.0 (next major)
+    $__APP next -b minor -p alpha.1  # v1.3.0-alpha.1
+    
+    # Create releases
+    $__APP bump                      # create v1.2.4 (patch)
+    $__APP bump -b minor             # create v1.3.0 (minor)
+    $__APP bump -b major             # create v2.0.0 (major)
+    
+    # Pre-release workflow
+    $__APP bump -b minor -p alpha.1  # create v1.3.0-alpha.1
+    $__APP bump -b pre -p alpha.2    # create v1.3.0-alpha.2
+    $__APP bump -b pre -p beta.1     # create v1.3.0-beta.1
+    $__APP bump -b minor             # create v1.3.0 (final)
+    
+    # Other operations
+    $__APP bump -b major -d          # dry run: shows v2.0.0
+    $__APP set v2.1.0                # set specific version
+
+EOF
+}
+
+_help_bump() {
+  cat << EOF
+USAGE: $__APP bump [-b <type>] [-p <id>] [-d]
+
+Bump type must be: major, minor, patch, or pre (default: patch)
+Use -p to add/update pre-release identifier.
+Use -d for dry run.
+
+EOF
+}
+
+_version() { 
+  sed -n 's/^# VERSION:[[:space:]]*\(.*\)/\1/p' "$__APPFILE" 2>/dev/null || echo "1.0.0"
+}
+
+_cleanup() { 
+  u.debug "cleanup"
+}
+##] functions
+
+##) app
+
+##( core
+_boot() {
+  local _source="${BASH_SOURCE[0]}"
+  while [[ -h "$_source" ]]; do # resolve $_source until the file is no longer a symlink
+    local _dir; _dir="$(cd -P "$(dirname "$_source")" && pwd)"
+    _source="$(readlink "$_source")"
+    [[ "$_source" != /* ]] && _source="$_dir/$_source"
+  done
+
+  readonly __APPDIR="$(cd -P "$(dirname "$_source")" && pwd)"
+  readonly __APPFILE="${BASH_SOURCE[0]}"
+
+  printf '%s\n' "${__OS[@]}" | grep -Fxq "$(u.os)" || u.die "unsupported OS: $(u.os) [required: ${__OS[*]}]"
+  local _tool; for _tool in "${__APP_DEPS[@]:-}"; do u.require "$_tool"; done
+}
+
+trap _cleanup EXIT
+if [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
+  _boot
+  _main "$@"
+fi
+##) core

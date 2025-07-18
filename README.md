@@ -8,6 +8,7 @@ A collection of useful tools and scripts in various languages (mainly shell) cov
 ## What's in the shed?
 
 - **[`sem-ver/`](sem-ver/)** - Semantic version bumping and management
+- **[`git-tag/`](git-tag/)** - Git tagging utilities
 - **[`.template/`](.template/)** - Template for creating new tools (also tested)
 
 ## Philosophy

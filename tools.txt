@@ -2,3 +2,4 @@
 # Format: tool-name:description
 .template:Template
 sem-ver:Semantic version bumping and management
+git-tag:Git tag management with semantic versioning
