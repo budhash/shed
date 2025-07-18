@@ -60,13 +60,14 @@ u.debug() { u.log -l "debug" "$@"; }
 
 ##) helpers
 
+
 ##( app
 
 ##[ config
 readonly __NAME=git-tag
 readonly __OS=(mac linux)
-readonly __APP_DEPS=(git)
 readonly __SEMVER_TOOL="${SEM_VER:-../sem-ver/sem-ver}"
+readonly __APP_DEPS=(git "$__SEMVER_TOOL")
 ##] config
 
 ##[ constants
@@ -76,26 +77,29 @@ readonly TAG_PATTERN="v*"
 
 ##[ validation
 _validate_git_repo() {
-  git rev-parse --git-dir >/dev/null 2>&1 || { u.error "not in a git repository"; exit $_E_NF; }
-}
-
-_validate_semver_tool() {
-  [[ -x "$__SEMVER_TOOL" ]] || { u.error "sem-ver tool not found at $__SEMVER_TOOL"; exit $_E_DEP; }
+  git rev-parse --git-dir >/dev/null 2>&1 || { u.error "not in a git repository - run 'git init' or 'cd' to a git repository"; exit $_E_NF; }
 }
 
 _validate_tag_format() {
   local tag="$1"
-  [[ "$tag" == ${TAG_PREFIX}* ]] || { u.error "invalid tag format: '$tag'. tag must start with '$TAG_PREFIX' (e.g., v1.2.3)"; exit $_E_USG; }
+  [[ "$tag" == ${TAG_PREFIX}* ]] || { u.error "invalid tag format '$tag' - tags must start with '$TAG_PREFIX' (e.g., v1.2.3)"; exit $_E_USG; }
   
   # Validate the version part using sem-ver
   local version="${tag#"$TAG_PREFIX"}"
-  "$__SEMVER_TOOL" validate "$version" >/dev/null 2>&1 || { u.error "invalid version format in tag: '$tag'"; exit $_E_USG; }
+  [[ -n "$version" ]] || { u.error "empty version after tag prefix '$TAG_PREFIX'"; exit $_E_USG; }
+  
+  # Delegate to sem-ver for sophisticated validation with detailed errors
+  local validation_output
+  if ! validation_output=$("$__SEMVER_TOOL" validate "$version" 2>&1); then
+    u.error "invalid version format in tag '$tag' - $validation_output"
+    exit $_E_USG
+  fi
 }
 
 _validate_tag_not_exists() {
   local tag="$1"
   if git tag -l "$tag" | grep -q "^$tag$"; then
-    u.error "tag '$tag' already exists"
+    u.error "tag '$tag' already exists - use 'git tag -d $tag' to remove if needed"
     exit $_E_USG
   fi
   return 0
@@ -103,7 +107,12 @@ _validate_tag_not_exists() {
 
 _validate_tag_greater() {
   local new_tag="$1" current_tag="$2"
-  "$__SEMVER_TOOL" gt "$new_tag" "$current_tag" >/dev/null 2>&1 || { u.error "new tag '$new_tag' must be greater than current highest tag '$current_tag'"; exit $_E_USG; }
+  local new_version="${new_tag#"$TAG_PREFIX"}" current_version="${current_tag#"$TAG_PREFIX"}"
+  
+  if ! "$__SEMVER_TOOL" gt "$new_version" "$current_version" >/dev/null 2>&1; then
+    u.error "new tag '$new_tag' must be greater than current highest tag '$current_tag' - use 'git-tag next -b <type>' to see valid versions"
+    exit $_E_USG
+  fi
 }
 ##] validation
 
@@ -139,7 +148,6 @@ _get_latest_chronological_tag() {
   u.debug "finding most recent chronological tag"
   local latest_tag
   latest_tag=$(git tag -l "$TAG_PATTERN" --sort=-creatordate 2>/dev/null | head -n 1)
-  
   [[ -z "$latest_tag" ]] && echo "${TAG_PREFIX}0.0.0" || echo "$latest_tag"
 }
 
@@ -159,6 +167,7 @@ _create_tag() {
   git tag -a "$tag" -m "$message"
   u.info "tag '$tag' created successfully"
   
+  # Simple push suggestion
   git remote >/dev/null 2>&1 && [[ $(git remote | wc -l) -gt 0 ]] && u.info "run 'git push origin $tag' to publish the tag"
   return 0
 }
@@ -197,7 +206,7 @@ _cmd_next() {
   # Validate bump type (but no other validation - just show calculation)
   case "$bump_type" in
     major|minor|patch|pre) ;;
-    *) u.error "invalid bump type: '$bump_type'. must be major, minor, patch, or pre"; exit $_E_USG ;;
+    *) u.error "invalid bump type '$bump_type' - must be major, minor, patch, or pre"; exit $_E_USG ;;
   esac
   
   _fetch_tags
@@ -248,18 +257,17 @@ _cmd_bump() {
       p) pre_release_id="$OPTARG" ;;
       d) dry_run=true ;;
       h) _help; exit 0 ;;
-      \?) u.error "invalid option for 'bump': -$OPTARG"; _help_bump; exit $_E_USG ;;
-      :) u.error "option -$OPTARG requires an argument"; _help_bump; exit $_E_USG ;;
+      \?) u.error "invalid option for 'bump': -$OPTARG"; exit $_E_USG ;;
+      :) u.error "option -$OPTARG requires an argument"; exit $_E_USG ;;
     esac
   done
   shift $((OPTIND - 1))
   
   [[ $# -eq 0 ]] || { u.error "'bump' command takes no additional arguments"; exit $_E_USG; }
   
-  # Validate bump type
   case "$bump_type" in
     major|minor|patch|pre) ;;
-    *) u.error "invalid bump type: '$bump_type'. must be major, minor, patch, or pre"; exit $_E_USG ;;
+    *) u.error "invalid bump type '$bump_type' - must be major, minor, patch, or pre"; exit $_E_USG ;;
   esac
   
   # Validate pre-release requirement
@@ -281,10 +289,7 @@ _cmd_bump() {
   new_version=$("$__SEMVER_TOOL" "${semver_args[@]}")
   local new_tag="${TAG_PREFIX}${new_version}"
   
-  # Only validate tag existence for non-dry-run
-  if [[ "$dry_run" != true ]]; then
-    _validate_tag_not_exists "$new_tag"
-  fi
+  [[ "$dry_run" != true ]] && _validate_tag_not_exists "$new_tag"
   
   if [[ "$dry_run" == true ]]; then
     u.info "dry run: would create tag '$new_tag'"
@@ -322,9 +327,7 @@ _cmd_set() {
 
 ##[ functions
 _main() {
-  # Tool-specific validations (must be in app section)
   _validate_git_repo
-  _validate_semver_tool
   
   local opt help=false version=false
   while getopts "hv" opt; do
@@ -338,8 +341,6 @@ _main() {
 
   [[ "$help" == true ]] && { _help; exit 0; }
   [[ "$version" == true ]] && { _version; exit 0; }
-  
-  # Require a subcommand
   [[ $# -eq 0 ]] && { u.error "missing command"; _help; exit $_E_USG; }
   
   local command="$1"
@@ -406,17 +407,6 @@ EXAMPLES:
     # Other operations
     $__APP bump -b major -d          # dry run: shows v2.0.0
     $__APP set v2.1.0                # set specific version
-
-EOF
-}
-
-_help_bump() {
-  cat << EOF
-USAGE: $__APP bump [-b <type>] [-p <id>] [-d]
-
-Bump type must be: major, minor, patch, or pre (default: patch)
-Use -p to add/update pre-release identifier.
-Use -d for dry run.
 
 EOF
 }

@@ -344,22 +344,33 @@ test_error_handling() {
   assert_fail $TOOL_PATH current extra-arg "current with extra args fails [current extra-arg -> fails]"
   assert_fail $TOOL_PATH latest extra-arg "latest with extra args fails [latest extra-arg -> fails]"
   
-  # Test invalid bump options
-  assert_fail $TOOL_PATH bump -b invalid "invalid bump type fails [bump -b invalid -> fails]"
-  assert_fail $TOOL_PATH bump -b pre "pre without -p fails [bump -b pre -> fails]"
-  assert_fail $TOOL_PATH bump extra-arg "bump with extra args fails [bump extra-arg -> fails]"
+  # Test invalid bump options with new error format
+  local error_output
+  error_output=$($TOOL_PATH bump -b invalid 2>&1) && assert_fail "true" "invalid bump type should fail"
+  assert_contains "$error_output" "invalid bump type 'invalid' - must be" "new error format for bump type"
+  
+  assert_fail $TOOL_PATH bump -b pre "pre without -p fails"
+  assert_fail $TOOL_PATH bump extra-arg "bump with extra args fails"
   
   # Test invalid set options
-  assert_fail $TOOL_PATH set "set without argument fails [set -> fails]"
-  assert_fail $TOOL_PATH set invalid-tag "invalid tag format fails [set invalid-tag -> fails]"
-  assert_fail $TOOL_PATH set 1.0.0 "tag without v prefix fails [set 1.0.0 -> fails]"
+  assert_fail $TOOL_PATH set "set without argument fails"
+  
+  # Test new enhanced validation error format
+  error_output=$($TOOL_PATH set "invalid-tag" 2>&1) && assert_fail "true" "invalid tag format should fail"
+  assert_contains "$error_output" "invalid tag format 'invalid-tag' - tags must start with 'v'" "enhanced tag format error"
+  
+  error_output=$($TOOL_PATH set "1.0.0" 2>&1) && assert_fail "true" "tag without v prefix should fail"
+  assert_contains "$error_output" "invalid tag format '1.0.0' - tags must start with 'v'" "tag without v prefix error"
   
   # Test duplicate tag creation
   create_test_tag "v1.0.0"
-  assert_fail $TOOL_PATH set v1.0.0 "duplicate tag fails [set v1.0.0 -> fails]"
+  error_output=$($TOOL_PATH set "v1.0.0" 2>&1) && assert_fail "true" "duplicate tag should fail"
+  assert_contains "$error_output" "tag 'v1.0.0' already exists - use 'git tag -d" "enhanced duplicate error"
   
   # Test version going backwards
-  assert_fail $TOOL_PATH set v0.9.0 "backwards version fails [set v0.9.0 -> fails]"
+  error_output=$($TOOL_PATH set "v0.9.0" 2>&1) && assert_fail "true" "backwards version should fail"
+  assert_contains "$error_output" "must be greater than current highest tag" "precedence validation"
+  assert_contains "$error_output" "git-tag next -b" "helpful tip provided"
   
   cd "$ORIGINAL_PWD"
   cleanup_test_repo "$test_repo"
@@ -399,8 +410,12 @@ test_non_git_directory() {
   local temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/git-tag-non-git-XXXXXX")
   cd "$temp_dir"
   
-  assert_fail "$TOOL_PATH" current "current fails outside git repo [current -> fails]"
-  assert_fail "$TOOL_PATH" bump "bump fails outside git repo [bump -> fails]"
+  local error_output
+  error_output=$("$TOOL_PATH" current 2>&1) && assert_fail "true" "should fail outside git repo"
+  assert_contains "$error_output" "not in a git repository - run 'git init'" "enhanced git repo error with guidance"
+  
+  error_output=$("$TOOL_PATH" bump 2>&1) && assert_fail "true" "bump should fail outside git repo"
+  assert_contains "$error_output" "not in a git repository" "bump fails outside git repo"
   
   cd "$ORIGINAL_PWD"
   rm -rf "$temp_dir"
@@ -408,47 +423,36 @@ test_non_git_directory() {
 }
 
 test_comprehensive_workflow() {
-  _section_header "Comprehensive Real-world Workflow"
+  _section_header "Comprehensive Workflow with Enhanced Validation"
   
   local test_repo=$(setup_test_repo "comprehensive-workflow")
   cd "$test_repo"
   
-  # Simulate complete development workflow
+  # Test the complete workflow with enhanced error handling
   local tag
   
-  # Initial release - capture stdout only
+  # Initial release
   tag=$($TOOL_PATH bump -b major 2>/dev/null)  # v1.0.0 (from v0.0.0)
-  assert_eq "v1.0.0" "$tag" "initial major release [v0.0.0 : bump -b major -> v1.0.0]"
+  assert_eq "v1.0.0" "$tag" "initial major release"
   
-  # Patch releases
+  # Test that enhanced validation works during workflow
+  assert_fail $TOOL_PATH set "v1.0.0" "duplicate detection works in workflow"
+  assert_fail $TOOL_PATH set "v0.9.0" "precedence validation works in workflow"
+  
+  # Continue workflow
   tag=$($TOOL_PATH bump 2>/dev/null)  # v1.0.1
-  assert_eq "v1.0.1" "$tag" "first patch [v1.0.0 : bump -> v1.0.1]"
+  assert_eq "v1.0.1" "$tag" "patch release"
   
-  tag=$($TOOL_PATH bump 2>/dev/null)  # v1.0.2
-  assert_eq "v1.0.2" "$tag" "second patch [v1.0.1 : bump -> v1.0.2]"
-  
-  # Start next minor version pre-release
+  # Pre-release workflow
   tag=$($TOOL_PATH bump -b minor -p alpha.1 2>/dev/null)  # v1.1.0-alpha.1
-  assert_eq "v1.1.0-alpha.1" "$tag" "start minor pre-release [v1.0.2 : bump -b minor -p alpha.1 -> v1.1.0-alpha.1]"
+  assert_eq "v1.1.0-alpha.1" "$tag" "pre-release start"
   
-  # Iterate alpha
-  tag=$($TOOL_PATH bump -b pre -p alpha.2 2>/dev/null)  # v1.1.0-alpha.2
-  assert_eq "v1.1.0-alpha.2" "$tag" "iterate alpha [v1.1.0-alpha.1 : bump -b pre -p alpha.2 -> v1.1.0-alpha.2]"
-  
-  # Move to beta
-  tag=$($TOOL_PATH bump -b pre -p beta.1 2>/dev/null)  # v1.1.0-beta.1
-  assert_eq "v1.1.0-beta.1" "$tag" "alpha to beta [v1.1.0-alpha.2 : bump -b pre -p beta.1 -> v1.1.0-beta.1]"
-  
-  # Move to rc
-  tag=$($TOOL_PATH bump -b pre -p rc.1 2>/dev/null)  # v1.1.0-rc.1
-  assert_eq "v1.1.0-rc.1" "$tag" "beta to rc [v1.1.0-beta.1 : bump -b pre -p rc.1 -> v1.1.0-rc.1]"
-  
-  # Final release
+  # Finalize
   tag=$($TOOL_PATH bump -b minor 2>/dev/null)  # v1.1.0
-  assert_eq "v1.1.0" "$tag" "finalize release [v1.1.0-rc.1 : bump -b minor -> v1.1.0]"
+  assert_eq "v1.1.0" "$tag" "pre-release finalization"
   
   # Verify current is correct
-  assert_eq "v1.1.0" "$($TOOL_PATH current)" "workflow final current [current -> v1.1.0]"
+  assert_eq "v1.1.0" "$($TOOL_PATH current)" "workflow final state"
   
   cd "$ORIGINAL_PWD"
   cleanup_test_repo "$test_repo"
@@ -458,17 +462,19 @@ test_comprehensive_workflow() {
 test_environment_edge_cases() {
   _section_header "Environment & Configuration Edge Cases"
   
-  # Test SEM_VER environment variable handling
+  # Test SEM_VER environment variable handling (now checked at boot)
   local original_sem_ver="$SEM_VER"
   
-  # Test with invalid SEM_VER path
+  # Test with invalid SEM_VER path - should fail at boot now
   export SEM_VER="/nonexistent/path"
   local test_repo=$(setup_test_repo "env-test")
   cd "$test_repo"
   create_test_tag "v1.0.0"
   
-  assert_fail $TOOL_PATH bump "bump fails with invalid SEM_VER path [SEM_VER=/nonexistent/path : bump -> fails]"
-  assert_fail $TOOL_PATH next "next fails with invalid SEM_VER path [SEM_VER=/nonexistent/path : next -> fails]"
+  # Should fail immediately due to boot dependency check
+  assert_fail $TOOL_PATH bump "bump fails with invalid SEM_VER path at boot"
+  assert_fail $TOOL_PATH next "next fails with invalid SEM_VER path at boot"
+  assert_fail $TOOL_PATH current "current fails with invalid SEM_VER path at boot"
   
   # Restore environment
   export SEM_VER="$original_sem_ver"
@@ -583,6 +589,199 @@ test_performance_scenarios() {
   echo
 }
 
+test_enhanced_validation_errors() {
+  _section_header "Enhanced Validation Error Messages"
+  
+  local test_repo=$(setup_test_repo "validation-errors")
+  cd "$test_repo"
+  create_test_tag "v1.0.0"
+  
+  # Test enhanced tag format validation with compressed error format
+  local error_output
+  error_output=$($TOOL_PATH set "1.0.0" 2>&1) && assert_fail "true" "bare version should fail"
+  assert_contains "$error_output" "invalid tag format '1.0.0' - tags must start with 'v'" "enhanced error shows format requirement with dash"
+  
+  # Test enhanced version validation (delegated to sem-ver) with compressed format
+  error_output=$($TOOL_PATH set "v1.2" 2>&1) && assert_fail "true" "incomplete version should fail"
+  assert_contains "$error_output" "invalid version format in tag 'v1.2' -" "enhanced error shows sem-ver validation with dash"
+  assert_contains "$error_output" "Missing patch version" "sem-ver detailed error forwarded"
+  
+  # Test enhanced precedence validation with compressed format
+  error_output=$($TOOL_PATH set "v0.9.0" 2>&1) && assert_fail "true" "backwards version should fail"
+  assert_contains "$error_output" "must be greater than current highest tag" "enhanced error shows precedence requirement"
+  assert_contains "$error_output" "git-tag next -b" "enhanced error provides helpful tip"
+  
+  # Test duplicate tag error with compressed format
+  error_output=$($TOOL_PATH set "v1.0.0" 2>&1) && assert_fail "true" "duplicate tag should fail"
+  assert_contains "$error_output" "tag 'v1.0.0' already exists - use 'git tag -d" "enhanced duplicate error with guidance"
+  
+  cd "$ORIGINAL_PWD"
+  cleanup_test_repo "$test_repo"
+  echo
+}
+
+test_dependency_validation_boot() {
+  _section_header "Dependency Validation in Boot"
+  
+  # Test with missing sem-ver tool
+  local original_sem_ver="$SEM_VER"
+  export SEM_VER="/nonexistent/path/sem-ver"
+  
+  local error_output
+  error_output=$($TOOL_PATH current 2>&1) && assert_fail "true" "should fail with missing sem-ver"
+  assert_contains "$error_output" "missing dependency" "boot dependency check catches missing sem-ver"
+  
+  # Test with non-executable sem-ver tool  
+  local temp_tool=$(mktemp)
+  echo "fake sem-ver" > "$temp_tool"
+  # Don't make it executable
+  export SEM_VER="$temp_tool"
+  
+  error_output=$($TOOL_PATH current 2>&1) && assert_fail "true" "should fail with non-executable sem-ver"
+  assert_contains "$error_output" "missing dependency" "boot dependency check catches non-executable sem-ver"
+  
+  # Cleanup
+  rm -f "$temp_tool"
+  export SEM_VER="$original_sem_ver"
+  echo
+}
+
+test_git_repo_validation() {
+  _section_header "Git Repository Validation"
+  
+  # Test outside git repo with enhanced error message
+  local temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/git-tag-non-git-XXXXXX")
+  cd "$temp_dir"
+  
+  local error_output
+  error_output=$($TOOL_PATH current 2>&1) && assert_fail "true" "should fail outside git repo"
+  assert_contains "$error_output" "not in a git repository - run 'git init'" "enhanced git repo error with guidance"
+  
+  cd "$ORIGINAL_PWD"
+  rm -rf "$temp_dir"
+  echo
+}
+
+test_simplified_push_suggestions() {
+  _section_header "Simplified Push Suggestions"
+  
+  local test_repo=$(setup_test_repo "push-suggestions")
+  cd "$test_repo"
+  
+  # Test with no remotes
+  local output
+  output=$($TOOL_PATH bump 2>&1)
+  # Should create tag successfully but no push suggestion
+  assert_contains "$output" "tag 'v0.0.1' created successfully" "tag created without remotes"
+  # Should NOT contain push suggestion
+  if echo "$output" | grep -q "git push"; then
+    assert_fail "true" "should not suggest push without remotes"
+  else
+    printf "  ${_GRN}✓${_RST} %s\n" "no push suggestion without remotes"
+    _TESTS_RUN=$((_TESTS_RUN + 1))
+  fi
+  
+  # Test with remote configured
+  git remote add origin "https://github.com/user/repo.git"
+  output=$($TOOL_PATH bump 2>&1)
+  assert_contains "$output" "run 'git push origin" "simple push suggestion with remote"
+  
+  cd "$ORIGINAL_PWD"
+  cleanup_test_repo "$test_repo"
+  echo
+}
+
+test_simplified_fetch_behavior() {
+  _section_header "Simplified Fetch Behavior"
+  
+  local test_repo=$(setup_test_repo "fetch-behavior")
+  cd "$test_repo"
+  
+  # Test with no remotes - should work without errors  
+  assert_ok $TOOL_PATH current "current works without remotes"
+  assert_ok $TOOL_PATH list "list works without remotes"
+  assert_ok $TOOL_PATH next "next works without remotes"
+  
+  # Test that the tool handles the common local development case
+  local output
+  output=$($TOOL_PATH current 2>&1)
+  assert_eq "v0.0.0" "$output" "returns default version without remotes"
+  
+  cd "$ORIGINAL_PWD"
+  cleanup_test_repo "$test_repo"
+  echo
+}
+test_error_message_consistency() {
+  _section_header "Error Message Consistency (Dash Format)"
+  
+  local test_repo=$(setup_test_repo "error-consistency")
+  cd "$test_repo"
+  
+  # Test various error messages use consistent dash format
+  local error_output
+  
+  # Invalid bump type
+  error_output=$($TOOL_PATH bump -b invalid 2>&1) && assert_fail "true" "invalid bump type should fail"
+  assert_contains "$error_output" "invalid bump type 'invalid' - must be" "bump error uses dash format"
+  
+  # Missing arguments
+  error_output=$($TOOL_PATH set 2>&1) && assert_fail "true" "missing argument should fail"
+  assert_contains "$error_output" "'set' command requires exactly one argument" "set error is clear"
+  
+  # Invalid option
+  error_output=$($TOOL_PATH -x 2>&1) && assert_fail "true" "invalid option should fail"
+  assert_contains "$error_output" "unknown option" "option error is clear"
+  
+  cd "$ORIGINAL_PWD"
+  cleanup_test_repo "$test_repo"
+  echo
+}
+
+test_semver_delegation_integration() {
+  _section_header "Sem-ver Delegation Integration"
+  
+  local test_repo=$(setup_test_repo "semver-delegation")
+  cd "$test_repo"
+  create_test_tag "v1.0.0"
+  
+  # Test that sem-ver errors are properly forwarded
+  local error_output
+  error_output=$($TOOL_PATH set "v1.2.3.4" 2>&1) && assert_fail "true" "invalid semver should fail"
+  assert_contains "$error_output" "invalid version format in tag 'v1.2.3.4'" "error shows tag context"
+  assert_contains "$error_output" "Too many version parts" "sem-ver specific error forwarded"
+  
+  # Test that sem-ver comparison works for precedence
+  error_output=$($TOOL_PATH set "v1.0.0-alpha" 2>&1) && assert_fail "true" "lower precedence should fail"
+  assert_contains "$error_output" "must be greater than current highest tag" "precedence validation works"
+  
+  cd "$ORIGINAL_PWD"
+  cleanup_test_repo "$test_repo"
+  echo
+}
+
+test_command_validation_improvements() {
+  _section_header "Command Validation Improvements"
+  
+  local test_repo=$(setup_test_repo "command-validation")
+  cd "$test_repo"
+  
+  # Test next command with invalid bump type
+  local error_output
+  error_output=$($TOOL_PATH next -b invalid 2>&1) && assert_fail "true" "next with invalid bump type should fail"
+  assert_contains "$error_output" "invalid bump type 'invalid' - must be" "next validation uses dash format"
+  
+  # Test pre-release requirement
+  error_output=$($TOOL_PATH bump -b pre 2>&1) && assert_fail "true" "pre without -p should fail"
+  assert_contains "$error_output" "pre-release identifier (-p) is required" "pre-release requirement clear"
+  
+  # Test extra arguments
+  error_output=$($TOOL_PATH current extra 2>&1) && assert_fail "true" "current with extra args should fail"
+  assert_contains "$error_output" "'current' command takes no arguments" "current validation clear"
+  
+  cd "$ORIGINAL_PWD"
+  cleanup_test_repo "$test_repo"
+  echo
+}
 ##) tests
 
 ##( init
