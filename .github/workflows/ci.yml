@@ -17,6 +17,15 @@ jobs:
     - name: Setup bash
       run: |
         bash --version
+        
+    - name: Install shellcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shellcheck
+        shellcheck --version
+      
+    - name: Run linting
+      run: make lint
       
     - name: Run all tests
       run: make test
@@ -24,5 +33,7 @@ jobs:
     - name: Test summary
       if: always()
       run: |
-        echo "Test execution completed"
+        echo "CI execution completed"
+        echo "✅ Linting passed"
+        echo "✅ Tests passed"
         echo "Check the logs above for detailed results"
