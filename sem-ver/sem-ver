@@ -73,7 +73,7 @@ readonly __APP_DEPS=(cut sort)
 readonly SEMVER_PATTERN='^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 ##] constants
 
-##[ validation helpers
+##[ validation
 _validate_bump_args() {
   local bump_type="$1" version="$2" pre_release_id="$3"
   
@@ -110,7 +110,7 @@ _validate_compare_args() {
   
   return 0
 }
-##] validation helpers
+##] validation
 
 ##[ functions
 _main() {
