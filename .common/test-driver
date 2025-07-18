@@ -1,10 +1,14 @@
 #!/bin/bash
-
+##( header
 # Test driver for shed tools
 # Discovers tools from tools.txt and runs their test suites
+##) header
 
+##( configuration
 set -euo pipefail
+##) configuration
 
+##( globals
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -27,7 +31,9 @@ SKIPPED_LIST=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 TOOLS_FILE="$PROJECT_ROOT/tools.txt"
+##) globals
 
+##( helpers
 # Function to print colored output
 print_status() {
     local status=$1
@@ -132,7 +138,9 @@ run_tool_tests() {
         FAILED_LIST+=("$tool_name")
     fi
 }
+##) helpers
 
+##( core
 # Main execution
 main() {
     print_banner
@@ -193,3 +201,4 @@ esac
 
 # Run main function
 main "$@"
+##) core

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
+##( header
 #
 # Test Suite for tool-name
 #
 # Replace 'tool-name' with your actual tool name.
-# Add your tool-specific tests in the test_custom_functionality function.
+##) header
 
 ##( configuration
 set -euo pipefail
@@ -18,10 +19,10 @@ NAME="tool-template"
 TOOL="./tool-template"
 ##) setup
 
-##( custom tests
+##( tests
 # Add tests for the template script
 test_custom_functionality() {
-  test_section "Template Functionality"
+  _section_header "Template Functionality"
   
   # Test that template shows help properly (check for actual template content)
   local help_output
@@ -45,11 +46,13 @@ test_custom_functionality() {
 
 # Test template completeness  
 test_template_completeness() {
-  test_section "Template Completeness"
+  _section_header "Template Completeness"
   
   # Check that template has all expected sections
+  assert_ok grep -q "##( header" "$TOOL" "has header section"
   assert_ok grep -q "##( configuration" "$TOOL" "has configuration section"
   assert_ok grep -q "##( metadata" "$TOOL" "has metadata section" 
+  assert_ok grep -q "##( globals" "$TOOL" "has globals section" 
   assert_ok grep -q "##( helpers" "$TOOL" "has helpers section"
   assert_ok grep -q "##( app" "$TOOL" "has app section"
   assert_ok grep -q "##( core" "$TOOL" "has core section"
@@ -61,8 +64,8 @@ test_template_completeness() {
   
   echo
 }
-##) custom tests
-##) custom tests
+##) tests
 
-# Run all tests
-test_runner
+##( core
+_test_runner # Run all tests
+##) core

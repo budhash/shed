@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+##( header
 # --------------------------------------------------------------------
 # {{app}} - {{detail}}
 # 
@@ -8,21 +9,16 @@
 # VERSION: {{version}}
 # LICENSE: {{license_name}}
 # --------------------------------------------------------------------
+##) header
 
 ##( configuration
 set -eEuo pipefail; IFS=$'\n\t'  # fail fast, secure IFS
 ##) configuration
 
 ##( metadata
-readonly __NAME=template
 readonly __APP="$(basename "${BASH_SOURCE[0]:-}")"
 __DBG=${DEBUG:-false}
 ##) metadata
-
-##( dependencies
-readonly __OS=(mac linux)
-readonly __DEPS=(find)
-##) dependencies
 
 ##( globals
 
@@ -65,6 +61,8 @@ u.debug() { u.log -l "debug" "$@"; }
 ##( app
 
 ##[ config
+readonly __NAME=template
+readonly __OS=(mac linux)
 readonly __APP_DEPS=(find)
 ##] config
 

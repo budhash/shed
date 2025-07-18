@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
+##( header
 #
 # Common Test Framework for shed tools
 #
 # Source this file from your tool's tests.sh:
 # source ../.common/test-common
+##) header
 
 ##( configuration
 set -euo pipefail
@@ -27,23 +29,17 @@ TOOL_NAME="$NAME"
 TOOL_SCRIPT="$TOOL"
 ##) globals
 
-##( test framework
+##( framework
 # Main test runner - call this from your tests.sh
-test_runner() {
+_test_runner() {
   echo "Running Test Suite for $NAME..."
   echo
   
   # Run standard tests first
   _test_standard_functionality
   
-  # Run custom tests (defined in individual test files)
-  if declare -f test_custom_functionality >/dev/null; then
-    test_custom_functionality
-  fi
-  
-  # Run any other test functions that start with test_ (but exclude test_runner and test_section)
-  local func
-  for func in $(declare -F | awk '/^declare -f test_/ {print $3}' | grep -v -E '^(test_runner|test_section|test_custom_functionality)$'); do
+  # Run any other test functions that start with test_ 
+  for func in $(declare -F | awk '/^declare -f test_/ {print $3}'); do
     if declare -f "$func" >/dev/null; then
       $func
     fi
@@ -62,7 +58,7 @@ test_runner() {
 }
 
 # Print test section header
-test_section() {
+_section_header() {
   local section_name="${1:-Unknown}"
   echo -e "${_BLU}Testing: $section_name${_RST}"
 }
@@ -161,12 +157,30 @@ assert_dir_exists() {
     printf "  ${_RED}✗${_RST} %s\n" "$desc"
   fi
 }
-##) test framework
+##) framework
 
-##( standard tests
+##( helper
+# Create a temporary directory for testing
+make_temp_dir() {
+  mktemp -d "${TMPDIR:-/tmp}/shed-test-${NAME}-XXXXXX"
+}
+
+# Create a temporary file for testing
+make_temp_file() {
+  mktemp "${TMPDIR:-/tmp}/shed-test-${NAME}-XXXXXX"
+}
+
+# Cleanup function for temp files
+cleanup_temp() {
+  local temp_path="$1"
+  [[ -n "$temp_path" && "$temp_path" =~ shed-test ]] && rm -rf "$temp_path"
+}
+##) helper
+
+##( tests
 # Standard tests that all tools should pass
 _test_standard_functionality() {
-  test_section "Standard Functionality"
+  _section_header "Standard Functionality"
   
   # Test if the main script exists and is executable
   assert_file_exists "$TOOL" "script file exists"
@@ -195,22 +209,4 @@ _test_standard_functionality() {
   
   echo
 }
-##) standard tests
-
-##( helper functions
-# Create a temporary directory for testing
-make_temp_dir() {
-  mktemp -d "${TMPDIR:-/tmp}/shed-test-${NAME}-XXXXXX"
-}
-
-# Create a temporary file for testing
-make_temp_file() {
-  mktemp "${TMPDIR:-/tmp}/shed-test-${NAME}-XXXXXX"
-}
-
-# Cleanup function for temp files
-cleanup_temp() {
-  local temp_path="$1"
-  [[ -n "$temp_path" && "$temp_path" =~ shed-test ]] && rm -rf "$temp_path"
-}
-##) helper functions
+##) tests
