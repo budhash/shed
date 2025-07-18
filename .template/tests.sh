@@ -39,7 +39,7 @@ test_custom_functionality() {
   # Test template runs without error (but may exit non-zero, that's ok for template)
   local run_output
   run_output=$($TOOL 2>&1 || true)
-  assert_contains "$run_output" "Template version" "template runs and shows template message"
+  assert_contains "$run_output" "template version" "template runs and shows template message"
   
   echo
 }

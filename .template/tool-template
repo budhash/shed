@@ -88,9 +88,9 @@ _main() {
   
   local _primary_arg="${1:-}"
   
-  u.info "Template version: $(_version) running on $(u.os)"
-  [[ -n "$_file" ]] && u.info "File option: $_file"
-  [[ -n "$_primary_arg" ]] && u.info "Primary argument: $_primary_arg"
+  u.info "template version: $(_version) running on $(u.os)"
+  [[ -n "$_file" ]] && u.info "file option: $_file"
+  [[ -n "$_primary_arg" ]] && u.info "primary argument: $_primary_arg"
   # Add your main application logic here
 }
 
@@ -118,7 +118,7 @@ _version() {
 }
 
 _cleanup() { 
-  u.debug "Cleanup"
+  u.debug "cleanup"
 }
 ##] functions
 
