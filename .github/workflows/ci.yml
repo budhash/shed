@@ -7,33 +7,61 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install shellcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shellcheck
+        
+    - name: Run linting
+      run: make lint
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bash-version: "latest"
+            description: "Ubuntu (bash 5.x)"
+          - os: macos-latest
+            bash-version: "system"
+            description: "macOS (bash 3.2.x)"
+    
+    name: Test on ${{ matrix.description }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Setup bash
+    - name: Setup bash and show version
       run: |
         bash --version
+        echo "BASH_VERSION=$BASH_VERSION"
         
-    - name: Install shellcheck
+    - name: Verify minimum bash version (macOS)
+      if: matrix.os == 'macos-latest'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y shellcheck
-        shellcheck --version
-      
-    - name: Run linting
-      run: make lint
-      
+        # Verify we're testing with bash 3.2+
+        bash_version=$(bash --version | head -n1 | grep -o '[0-9]\+\.[0-9]\+')
+        echo "Detected bash version: $bash_version"
+        if [[ "$bash_version" < "3.2" ]]; then
+          echo "ERROR: Bash version too old: $bash_version"
+          exit 1
+        fi
+        echo "✅ macOS bash version $bash_version meets minimum requirement (3.2+)"
+        
     - name: Run all tests
       run: make test
       
     - name: Test summary
       if: always()
       run: |
-        echo "CI execution completed"
-        echo "✅ Linting passed"
-        echo "✅ Tests passed"
-        echo "Check the logs above for detailed results"
+        echo "✅ Tests completed on ${{ matrix.description }}"
+        echo "Platform: ${{ runner.os }}"
+        echo "Runner: ${{ matrix.os }}"
