@@ -546,7 +546,7 @@ test_performance_scenarios() {
   local test_repo=$(setup_test_repo "performance")
   cd "$test_repo"
   
-  # Create many tags to test sorting performance
+  # Create many tags to test sorting performance (with timing separation for CI)
   for i in {1..20}; do
     create_test_tag "v1.$i.0" "Release 1.$i.0"
   done
@@ -554,7 +554,8 @@ test_performance_scenarios() {
   # Should still find highest correctly with many tags
   assert_eq "v1.20.0" "$($TOOL_PATH current 2>/dev/null)" "current works with many tags [current with 20 tags -> v1.20.0]"
   
-  # Test chronological vs semantic ordering
+  # Test chronological vs semantic ordering (ensure timing separation)
+  sleep 1  # Ensure different timestamp
   create_test_tag "v1.5.1" "Created later but lower version"
   assert_eq "v1.20.0" "$($TOOL_PATH current 2>/dev/null)" "semantic ordering prevails over chronological [current -> v1.20.0 not v1.5.1]"
   
@@ -566,13 +567,15 @@ test_performance_scenarios() {
   assert_contains "$list_output" "v1.1.0" "list includes middle version [list -> includes v1.1.0]"
   
   # Test with mixed semantic versions for complex sorting
+  sleep 1  # Ensure different timestamp
   create_test_tag "v2.0.0-alpha.1" "Pre-release"
+  sleep 1  # Ensure different timestamp  
   create_test_tag "v1.99.99" "High patch number"
   
   # Current should still be v2.0.0-alpha.1 (highest semantic)
   assert_eq "v2.0.0-alpha.1" "$($TOOL_PATH current 2>/dev/null)" "complex sorting finds highest semantic [current -> v2.0.0-alpha.1]"
   
-  # Latest should be most recent chronological
+  # Latest should be most recent chronological (v1.99.99 created last)
   assert_eq "v1.99.99" "$($TOOL_PATH latest 2>/dev/null)" "latest finds most recent chronological [latest -> v1.99.99]"
   
   cd "$ORIGINAL_PWD"
