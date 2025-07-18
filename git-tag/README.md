@@ -14,6 +14,11 @@ A tool for managing Git tags based on semantic versioning. Can get the current t
 - **Dual tag concepts** - Highest semantic version vs. most recent chronological
 - **Cross-platform** - Works on macOS (bash 3.2+) and Linux
 
+## Requirements
+
+- **bash** 3.2+ (for macOS compatibility)
+- **Git** - Repository operations and tag management
+
 ## Usage
 
 ```bash

@@ -14,6 +14,11 @@ A tool for bumping and comparing version strings according to the Semantic Versi
 - **Build metadata handling** - Proper handling and ignoring per SemVer specification
 - **Cross-platform** - Works on macOS (bash 3.2+) and Linux
 
+## Requirements
+
+- **bash** 3.2+ (for macOS compatibility)
+- **Git** - Repository operations and tag management
+
 ## Usage
 
 ```bash

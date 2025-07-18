@@ -12,6 +12,10 @@ A more detailed description of the tool's purpose, what problems it solves, and 
 - **Feature 3** - What makes this tool unique
 - **Cross-platform** - Works on macOS (bash 3.2+) and Linux
 
+## Requirements
+
+- **bash** 3.2+ (for macOS compatibility)
+
 ## Usage
 
 ```bash
