@@ -1,0 +1,3 @@
+# Shed Tools Registry
+# Format: tool-name:description
+.template:Template

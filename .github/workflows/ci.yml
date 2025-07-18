@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup bash
+      run: |
+        bash --version
+      
+    - name: Run all tests
+      run: make test
+      
+    - name: Test summary
+      if: always()
+      run: |
+        echo "Test execution completed"
+        echo "Check the logs above for detailed results"
