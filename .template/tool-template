@@ -17,6 +17,9 @@ set -eEuo pipefail; IFS=$'\n\t'  # fail fast, secure IFS
 
 ##( metadata
 readonly __APP="$(basename "${BASH_SOURCE[0]:-}")"
+readonly __APPFILE="${BASH_SOURCE[0]}"
+readonly __APPDIR="$(s="${BASH_SOURCE[0]}"; while [[ -h "$s" ]]; do 
+  d="$(cd -P "$(dirname "$s")" && pwd)"; s="$(readlink "$s")"; [[ "$s" != /* ]] && s="$d/$s"; done; cd -P "$(dirname "$s")" && pwd)"
 __DBG=${DEBUG:-false}
 ##) metadata
 
@@ -38,8 +41,16 @@ readonly _E=1 _E_USG=2 _E_DEP=3 _E_OS=4 _E_NF=5 _E_NP=6 _E_NC=7
 
 ##[ system
 u.os() { case "${OSTYPE:-}" in darwin*) echo mac;; linux*) echo linux;; *) echo unknown;; esac; }
-u.require() { command -v "${1:-}" >/dev/null || { u.error "missing dependency: ${1:-}"; exit $_E_DEP; }; }
 u.die() { u.error "$@"; exit $_E; }
+u.require() { 
+  local tool="${1:-}"
+  [[ -z "$tool" ]] && { u.error "missing dependency name"; exit $_E_DEP; }
+  if [[ "$tool" == /* ]] || [[ "$tool" == ./* ]] || [[ "$tool" == ../* ]]; then
+    [[ -x "$tool" ]] || { u.error "missing dependency: $tool"; exit $_E_DEP; } # Absolute or relative path - test directly
+  else
+    command -v "$tool" >/dev/null || { u.error "missing dependency: $tool"; exit $_E_DEP; }
+  fi
+}
 ##] system
 
 ##[ logging
@@ -126,16 +137,6 @@ _cleanup() {
 
 ##( core
 _boot() {
-  local _source="${BASH_SOURCE[0]}"
-  while [[ -h "$_source" ]]; do # resolve $_source until the file is no longer a symlink
-    local _dir; _dir="$(cd -P "$(dirname "$_source")" && pwd)"
-    _source="$(readlink "$_source")"
-    [[ "$_source" != /* ]] && _source="$_dir/$_source"
-  done
-
-  readonly __APPDIR="$(cd -P "$(dirname "$_source")" && pwd)"
-  readonly __APPFILE="${BASH_SOURCE[0]}"
-
   printf '%s\n' "${__OS[@]}" | grep -Fxq "$(u.os)" || u.die "unsupported OS: $(u.os) [required: ${__OS[*]}]"
   local _tool; for _tool in "${__APP_DEPS[@]:-}"; do u.require "$_tool"; done
 }
