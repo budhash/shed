@@ -690,7 +690,6 @@ test_simplified_push_suggestions() {
   cleanup_test_repo "$test_repo"
   echo
 }
-
 test_simplified_fetch_behavior() {
   _section_header "Simplified Fetch Behavior"
   
@@ -703,14 +702,16 @@ test_simplified_fetch_behavior() {
   assert_ok $TOOL_PATH next "next works without remotes"
   
   # Test that the tool handles the common local development case
+  # IMPORTANT: Only capture stdout, not stderr (debug messages go to stderr)
   local output
-  output=$($TOOL_PATH current 2>&1)
+  output=$($TOOL_PATH current)  # Remove 2>&1 to only capture stdout
   assert_eq "v0.0.0" "$output" "returns default version without remotes"
   
   cd "$ORIGINAL_PWD"
   cleanup_test_repo "$test_repo"
   echo
 }
+
 test_error_message_consistency() {
   _section_header "Error Message Consistency (Dash Format)"
   
