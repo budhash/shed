@@ -79,15 +79,17 @@ readonly __NAME=git-tag
 readonly __OS=(mac linux)
 readonly __SEMVER_TOOL="$(
   d="$__APPDIR"
+  echo "DEBUG: Resolving SEMVER_TOOL" >&2
   echo "DEBUG: d=$d" >&2
   echo "DEBUG: SEM_VER=${SEM_VER:-UNSET}" >&2
   echo "DEBUG: pwd=$(pwd)" >&2
-  echo "DEBUG: BASH_SOURCE[0]=${BASH_SOURCE[0]}" >&2
   
   # If SEM_VER is explicitly set, respect user's choice (strict mode)
   if [[ -n "${SEM_VER:-}" ]]; then
+    echo "DEBUG: SEM_VER is set, using it" >&2
     clean_semver="$(printf '%s' "$SEM_VER" | tr -d '\n' | sed 's/^-n *//; s/^[[:space:]]*//')"
-    echo "DEBUG: Using SEM_VER: $clean_semver" >&2
+    echo "DEBUG: clean_semver='$clean_semver'" >&2
+    echo "DEBUG: Checking if clean_semver exists: $(test -f "$clean_semver" && echo YES || echo NO)" >&2
     echo "$clean_semver"
   else
     echo "DEBUG: SEM_VER not set, trying fallbacks" >&2
@@ -363,6 +365,7 @@ _cmd_set() {
 
 ##[ functions
 _main() {
+  echo "DEBUG: Starting _main, SEMVER_TOOL='$__SEMVER_TOOL'" >&2
   _validate_git_repo
   
   local opt help=false version=false
