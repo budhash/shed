@@ -88,7 +88,6 @@ readonly __SEMVER_TOOL="$(
     echo "$__APPDIR/sem-ver"
   fi
 )"
-
 readonly __APP_DEPS=(git "$__SEMVER_TOOL")
 ##] config
 

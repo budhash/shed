@@ -791,16 +791,8 @@ ORIGINAL_PWD="$(pwd)"
 TOOL_PATH="$(realpath "$TOOL")"
 SEMVER_PATH="$(realpath "../sem-ver/sem-ver")"
 
-echo "=== TEST DEBUG ===" >&2
-echo "ORIGINAL_PWD: $ORIGINAL_PWD" >&2
-echo "TOOL_PATH: $TOOL_PATH" >&2
-echo "SEMVER_PATH: $SEMVER_PATH" >&2
-echo "SEM_VER before export: ${SEM_VER:-UNSET}" >&2
-
 # Export SEM_VER environment variable for git-tag to use
 export SEM_VER="$SEMVER_PATH"
-echo "SEM_VER after export: $SEM_VER" >&2
-echo "=== END TEST DEBUG ===" >&2
 ##) init
 
 ##( core

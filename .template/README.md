@@ -95,17 +95,57 @@ fi
 - **Standard Unix tools**: find, sed, grep, awk
 - **Additional dependencies**: (list any tool-specific dependencies)
 
-### Dependencies
+## External Dependencies
 
-If your tool depends on other tools in the shed:
+If your tool depends on other external tools, use this bash 3.2 compatible pattern:
+
+### Pattern for External Tool Dependencies
 
 ```bash
-# Set dependency paths
-export DEPENDENCY_TOOL="/path/to/dependency"
+##[ config
+readonly __NAME=your-tool
+readonly __OS=(mac linux)
 
-# Or use relative paths (default)
-# Expects ../dependency-tool/dependency-tool relative to tool-name
+# External dependency resolution (bash 3.2 compatible)
+readonly __EXTERNAL_TOOL="$(
+  if [[ -n "${ENV_VAR:-}" ]]; then
+    echo "$ENV_VAR" | sed 's/^-n *//; s/^[[:space:]]*//; s/[[:space:]]*$//'
+  elif [[ -x "$__APPDIR/../tool-name/tool-name" ]]; then
+    echo "$__APPDIR/../tool-name/tool-name"
+  elif [[ -x "$__APPDIR/tool-name" ]]; then
+    echo "$__APPDIR/tool-name"
+  else
+    echo "$__APPDIR/tool-name"  # or "tool-name" for system PATH
+  fi
+)"
+
+readonly __APP_DEPS=(standard-deps "$__EXTERNAL_TOOL")
+##] config
 ```
+
+### Customization Example
+
+For a tool that depends on `docker`:
+
+```bash
+readonly __DOCKER_TOOL="$(
+  if [[ -n "${DOCKER_PATH:-}" ]]; then
+    echo "$DOCKER_PATH" | sed 's/^-n *//; s/^[[:space:]]*//; s/[[:space:]]*$//'
+  elif [[ -x "$__APPDIR/../docker/docker" ]]; then
+    echo "$__APPDIR/../docker/docker"
+  elif [[ -x "$__APPDIR/docker" ]]; then
+    echo "$__APPDIR/docker"
+  else
+    echo "docker"  # System PATH fallback
+  fi
+)"
+
+readonly __APP_DEPS=(git "$__DOCKER_TOOL")
+```
+
+### Working Examples
+
+See `git-tag` (depends on `sem-ver`) for a real implementation of this pattern.
 
 ## Installation
 
