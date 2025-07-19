@@ -14,10 +14,52 @@ A tool for managing Git tags based on semantic versioning. Can get the current t
 - **Dual tag concepts** - Highest semantic version vs. most recent chronological
 - **Cross-platform** - Works on macOS (bash 3.2+) and Linux
 
+## Dependencies
+
+### Required Dependencies
+**git-tag** depends on two components to function properly:
+
+#### 1. Git Repository
+- Must be run within a Git repository (`git init` if needed)
+- Uses Git commands for tag creation, listing, and management
+- Supports both local and remote Git repositories
+
+#### 2. sem-ver Tool (Required)
+**git-tag** delegates all version calculations to the **sem-ver** tool:
+
+- **Version comparison** - Finding highest semantic version vs. chronological
+- **Version bumping** - Calculating next major/minor/patch/pre-release versions  
+- **Version validation** - Ensuring SemVer 2.0.0 compliance
+- **Pre-release handling** - Complex pre-release precedence rules
+
+**Automatic Discovery:**
+git-tag automatically finds sem-ver in these locations (in order):
+1. `$SEM_VER` environment variable (if set)
+2. `../sem-ver/sem-ver` (standard shed structure)
+3. `./sem-ver` (same directory as git-tag)
+
+### Tool Relationship
+```bash
+# git-tag provides Git repository integration
+./git-tag current                    # Find highest tag in repository
+./git-tag bump -b minor              # Calculate + create new Git tag
+
+# sem-ver provides version calculations (used internally by git-tag)
+./sem-ver compare -c gt v1.3.0 v1.2.3  # Version comparison logic
+./sem-ver bump -b minor v1.2.3         # Version calculation logic
+```
+
+**Why separate tools?**
+- **git-tag**: High-level Git workflows (current, bump, list, set)
+- **sem-ver**: Low-level version operations (compare, validate, parse)
+- **Flexibility**: Use sem-ver standalone for non-Git version management
+- **Modularity**: Each tool focused on its specific domain
+
 ## Requirements
 
 - **bash** 3.2+ (for macOS compatibility)
 - **Git** - Repository operations and tag management
+- **sem-ver tool** - Semantic version calculations (see Installation)
 
 ## Usage
 
@@ -147,57 +189,116 @@ fi
 ./git-tag bump -b pre -p build.123    # v1.0.0-build.123
 ```
 
-## Requirements
-
-- **bash** 3.2+ (for macOS compatibility)
-- **Git** - Repository operations
-- **sem-ver tool** - Semantic version calculations (see Dependencies)
-
-### Dependencies
-
-The tool requires the `sem-ver` tool for version calculations. Set the path using:
-
-```bash
-# Environment variable
-export SEM_VER="/path/to/sem-ver"
-
-# Or relative path (default)
-# Expects ../sem-ver/sem-ver relative to git-tag
-```
-
 ## Installation
 
-### From shed repository
-```bash
-# Use directly
-./git-tag/git-tag -h
+### Option 1: Complete Shed Toolkit (Recommended)
+Download both **git-tag** and **sem-ver** for full Git repository version management:
 
-# Install to PATH
-curl -o /usr/local/bin/git-tag https://raw.githubusercontent.com/yourusername/shed/main/git-tag/git-tag
-chmod +x /usr/local/bin/git-tag
+```bash
+# Create shed directory
+mkdir -p ~/.local/shed
+cd ~/.local/shed
+
+# Download both tools (git-tag requires sem-ver)
+curl -O https://raw.githubusercontent.com/budhash/shed/main/git-tag/git-tag
+curl -O https://raw.githubusercontent.com/budhash/shed/main/sem-ver/sem-ver
+
+# Make executable
+chmod +x git-tag sem-ver
+
+# Add to PATH (add to your ~/.bashrc or ~/.zshrc)
+export PATH="$HOME/.local/shed:$PATH"
+
+# Test installation
+cd /path/to/your/git/repo
+git-tag current                      # Should show current version
+git-tag list                         # Should list existing tags
 ```
 
-### Standalone
+### Option 2: Shed Repository Structure
+For development or to get all shed tools:
+
 ```bash
-# Download and make executable
-curl -O https://raw.githubusercontent.com/yourusername/shed/main/git-tag/git-tag
-chmod +x git-tag
+git clone https://github.com/budhash/shed.git
+cd shed
 
-# Set up sem-ver dependency
-curl -O https://raw.githubusercontent.com/yourusername/shed/main/sem-ver/sem-ver
-chmod +x sem-ver
-export SEM_VER="./sem-ver"
+# Use directly (tools auto-discover each other in shed structure)
+./git-tag/git-tag current
+./git-tag/git-tag bump -b patch
 
-./git-tag -h
+# Or install to PATH
+sudo cp git-tag/git-tag /usr/local/bin/
+sudo cp sem-ver/sem-ver /usr/local/bin/
+```
+
+### Option 3: Custom Installation Locations
+If you need to install tools in different locations:
+
+```bash
+# Download tools to custom locations
+curl -o /usr/local/bin/git-tag https://raw.githubusercontent.com/budhash/shed/main/git-tag/git-tag
+curl -o /custom/path/sem-ver https://raw.githubusercontent.com/budhash/shed/main/sem-ver/sem-ver
+
+chmod +x /usr/local/bin/git-tag /custom/path/sem-ver
+
+# Configure sem-ver location for git-tag
+export SEM_VER="/custom/path/sem-ver"
+
+# Test configuration
+git-tag current  # Should find sem-ver at custom location
+```
+
+### Docker/Container Usage
+For containerized environments:
+
+```bash
+# Dockerfile example
+FROM alpine:latest
+RUN apk add --no-cache bash git curl
+
+# Install both tools
+RUN curl -o /usr/local/bin/git-tag https://raw.githubusercontent.com/budhash/shed/main/git-tag/git-tag && \
+    curl -o /usr/local/bin/sem-ver https://raw.githubusercontent.com/budhash/shed/main/sem-ver/sem-ver && \
+    chmod +x /usr/local/bin/git-tag /usr/local/bin/sem-ver
+
+# Use in CI/CD
+COPY . /workspace
+WORKDIR /workspace
+RUN git-tag current
+```
+
+### Troubleshooting Installation
+
+**Issue: "missing dependency: sem-ver"**
+```bash
+# Check if sem-ver is in PATH
+which sem-ver
+
+# Check if sem-ver is executable
+ls -la $(which sem-ver)
+
+# Set custom location if needed
+export SEM_VER="/path/to/sem-ver"
+```
+
+**Issue: "not in a git repository"**
+```bash
+# Initialize Git repo if needed
+git init
+git add .
+git commit -m "Initial commit"
+
+# Or cd to existing Git repository
+cd /path/to/git/repo
 ```
 
 ## Testing
 
 ```bash
-# Run tests
-./tests.sh
+# Run tests (if cloned from repository)
+cd git-tag && ./tests.sh
 
-# Or from shed root
+# Or test from shed root
 ./.common/test-driver
 
 # Or use Makefile
@@ -224,15 +325,231 @@ v1.0.0-alpha < v1.0.0-alpha.1 < v1.0.0-beta < v1.0.0-beta.2 < v1.0.0-rc.1 < v1.0
 - `current` - Highest semantic version tag
 - `latest` - Most recently created tag (chronological)
 
-## Error Handling
+## Advanced Usage
 
-The tool validates all operations and provides specific error messages:
+### Environment Configuration
+```bash
+# Custom sem-ver location
+export SEM_VER="/path/to/custom/sem-ver"
 
-- Repository must be a Git repository
-- New tags must be semantically higher than current highest
-- Invalid version formats are rejected
-- Duplicate tags are prevented
-- Missing dependencies are detected
+# Enable debug logging
+export DEBUG=true
+git-tag current  # Shows debug information
+
+# Disable colors
+export NO_COLOR=1
+git-tag list     # Plain text output
+```
+
+### Integration with Release Automation
+```bash
+#!/bin/bash
+# Example release script
+
+set -euo pipefail
+
+# Get current version
+CURRENT=$(git-tag current)
+echo "Current version: $CURRENT"
+
+# Determine bump type from commit messages since last tag
+if git log "$CURRENT"..HEAD --oneline | grep -q "BREAKING CHANGE\|!:"; then
+    BUMP_TYPE="major"
+elif git log "$CURRENT"..HEAD --oneline | grep -q "feat:"; then
+    BUMP_TYPE="minor"
+else
+    BUMP_TYPE="patch"
+fi
+
+echo "Determined bump type: $BUMP_TYPE"
+
+# Preview the release
+NEXT_VERSION=$(git-tag next -b "$BUMP_TYPE")
+echo "Next version will be: $NEXT_VERSION"
+
+# Confirm and create release
+read -p "Create release $NEXT_VERSION? (y/N) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    NEW_TAG=$(git-tag bump -b "$BUMP_TYPE")
+    echo "Created release: $NEW_TAG"
+    
+    # Push to remote
+    git push origin "$NEW_TAG"
+    echo "Pushed $NEW_TAG to remote"
+else
+    echo "Release cancelled"
+fi
+```
+
+### GitHub Actions Integration
+```yaml
+# .github/workflows/release.yml
+name: Create Release
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for git-tag
+        
+    - name: Install shed tools
+      run: |
+        curl -o git-tag https://raw.githubusercontent.com/budhash/shed/main/git-tag/git-tag
+        curl -o sem-ver https://raw.githubusercontent.com/budhash/shed/main/sem-ver/sem-ver
+        chmod +x git-tag sem-ver
+        
+    - name: Create release
+      run: |
+        # Determine if we should release
+        if git log --oneline HEAD~1..HEAD | grep -q "feat:\|fix:\|BREAKING CHANGE"; then
+          # Determine bump type and create release
+          if git log --oneline HEAD~1..HEAD | grep -q "BREAKING CHANGE"; then
+            NEW_TAG=$(./git-tag bump -b major)
+          elif git log --oneline HEAD~1..HEAD | grep -q "feat:"; then
+            NEW_TAG=$(./git-tag bump -b minor)
+          else
+            NEW_TAG=$(./git-tag bump -b patch)
+          fi
+          
+          echo "Created release: $NEW_TAG"
+          git push origin "$NEW_TAG"
+          
+          # Create GitHub release
+          gh release create "$NEW_TAG" --generate-notes
+        else
+          echo "No release needed"
+        fi
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+#### GitHub Actions Flow Explanation
+
+**Workflow Expectations:**
+- **Conventional Commits**: Uses conventional commit messages to determine release type
+- **Automatic Versioning**: Analyzes commit history to decide bump type (major/minor/patch)
+- **Git Tag Creation**: Creates properly formatted semantic version tags
+- **GitHub Release**: Automatically creates GitHub releases with generated notes
+
+**Flow Breakdown:**
+
+1. **Trigger**: Runs on every push to `main` branch
+2. **History Analysis**: 
+   - `BREAKING CHANGE` in commits → Major release (v1.0.0 → v2.0.0)
+   - `feat:` commits → Minor release (v1.0.0 → v1.1.0)
+   - `fix:` commits → Patch release (v1.0.0 → v1.0.1)
+   - No matching commits → No release created
+3. **Tag Creation**: Uses `git-tag bump` to create new semantic version tag
+4. **Git Push**: Pushes new tag to remote repository
+5. **GitHub Release**: Creates GitHub release with auto-generated release notes
+
+**Prerequisites:**
+- Repository must use [Conventional Commits](https://www.conventionalcommits.org/)
+- `GH_TOKEN` with appropriate permissions for creating releases
+- At least one existing tag in repository (or workflow will create v0.0.1)
+
+**Customization Options:**
+```yaml
+# Custom commit message patterns
+if git log --oneline HEAD~1..HEAD | grep -q "breaking:\|major:"; then
+  NEW_TAG=$(./git-tag bump -b major)
+elif git log --oneline HEAD~1..HEAD | grep -q "feature:\|minor:"; then
+  NEW_TAG=$(./git-tag bump -b minor)
+else
+  NEW_TAG=$(./git-tag bump -b patch)
+fi
+
+# Pre-release workflow
+if [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+  NEW_TAG=$(./git-tag bump -b minor -p alpha.$(date +%Y%m%d%H%M))
+fi
+```
+
+### Makefile Integration
+For projects using Make, integrate git-tag into your build process:
+
+```makefile
+# Get version from git-tag or fall back to default
+VERSION := $(shell ./git-tag current 2>/dev/null | sed 's/^v//' || echo "0.0.0")
+GIT_TAG_NAME := v$(VERSION)
+
+.PHONY: tag-release version
+
+## Show current version information
+version:
+    @echo "Current version: $(VERSION)"
+    @echo "Git tag: $(GIT_TAG_NAME)"
+    @./git-tag list | head -5
+
+tag-release: ## 🔖  Create and push a git tag based on the .version file.
+    @echo "🔖  Tagging release with version $(GIT_TAG_NAME)..."
+    @if git rev-parse $(GIT_TAG_NAME) >/dev/null 2>&1; then \
+        echo "ℹ️  Tag $(GIT_TAG_NAME) already exists. Skipping creation."; \
+    else \
+        git tag -a $(GIT_TAG_NAME) -m "Release $(VERSION)"; \
+    fi
+    @echo "📤  Pushing tag $(GIT_TAG_NAME) to remote..."
+    @git push origin $(GIT_TAG_NAME)
+
+## Create next version tag with git-tag
+release-patch: 
+    @./git-tag bump -b patch
+    @$(MAKE) push-tags
+
+release-minor:
+    @./git-tag bump -b minor  
+    @$(MAKE) push-tags
+
+release-major:
+    @./git-tag bump -b major
+    @$(MAKE) push-tags
+
+## Push all tags to remote
+push-tags:
+    @echo "📤  Pushing all tags to remote..."
+    @git push --tags
+
+## Preview next release version
+next-version:
+    @echo "Next patch: $(./git-tag next -b patch)"
+    @echo "Next minor: $(./git-tag next -b minor)"
+    @echo "Next major: $(./git-tag next -b major)"
+
+help: ## 📚  Show this help message
+    @echo "Available targets:"
+    @grep -E '^[a-zA-Z_-]+:.*?## .*$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $1, $2}'
+```
+
+**Makefile Usage:**
+```bash
+# Show current version and recent tags
+make version
+
+# Create and push patch release
+make release-patch
+
+# Preview what the next versions would be
+make next-version
+
+# Traditional manual tag creation (using your existing target)
+make tag-release
+
+# Show all available targets
+make help
+```
+
+**Makefile Benefits:**
+- **Version consistency** - Single source of truth for version information
+- **Release automation** - Simple `make release-patch` commands
+- **Integration** - Works with existing build processes
+- **Preview capability** - See what versions would be created
+- **Flexibility** - Mix manual and automated approaches
 
 ## License
 
@@ -249,4 +566,5 @@ The tool validates all operations and provides specific error messages:
 - Comprehensive validation and error handling
 - Git repository integration with proper tag creation and annotation
 - Cross-platform compatibility (macOS bash 3.2+ and Linux)
-- Environment variable configuration for sem-ver tool path
+- Robust dependency resolution with automatic sem-ver discovery
+- Environment variable configuration for custom tool paths
