@@ -78,16 +78,14 @@ u.debug() { u.log -l "debug" "$@"; }
 readonly __NAME=git-tag
 readonly __OS=(mac linux)
 readonly __SEMVER_TOOL="$(
-  d="$__APPDIR"
-  # If SEM_VER is explicitly set, respect user's choice (strict mode)
   if [[ -n "${SEM_VER:-}" ]]; then
-    clean_semver="$(printf '%s' "$SEM_VER" | tr -d '\n' | sed 's/^-n *//; s/^[[:space:]]*//')" # Clean any contamination but use the cleaned value even if bad
-    echo "$clean_semver"
+    echo "$SEM_VER" | sed 's/^-n *//; s/^[[:space:]]*//; s/[[:space:]]*$//'
+  elif [[ -x "$__APPDIR/../sem-ver/sem-ver" ]]; then
+    echo "$__APPDIR/../sem-ver/sem-ver"
+  elif [[ -x "$__APPDIR/sem-ver" ]]; then
+    echo "$__APPDIR/sem-ver"
   else
-    # SEM_VER not set, use intelligent fallbacks  
-    [[ -x "$d/../sem-ver/sem-ver" ]] && echo "$d/../sem-ver/sem-ver" && exit
-    [[ -x "$d/sem-ver" ]] && echo "$d/sem-ver" && exit
-    echo "$d/sem-ver"
+    echo "$__APPDIR/sem-ver"
   fi
 )"
 readonly __APP_DEPS=(git "$__SEMVER_TOOL")
@@ -350,6 +348,7 @@ _cmd_set() {
 
 ##[ functions
 _main() {
+  echo "DEBUG: Starting _main, SEMVER_TOOL='$__SEMVER_TOOL'" >&2
   _validate_git_repo
   
   local opt help=false version=false
