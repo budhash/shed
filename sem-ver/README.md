@@ -183,14 +183,14 @@ fi
 ./sem-ver/sem-ver -h
 
 # Install to PATH
-curl -o /usr/local/bin/sem-ver https://raw.githubusercontent.com/yourusername/shed/main/sem-ver/sem-ver
+curl -o /usr/local/bin/sem-ver https://raw.githubusercontent.com/budhash/shed/main/sem-ver/sem-ver
 chmod +x /usr/local/bin/sem-ver
 ```
 
 ### Standalone
 ```bash
 # Download and make executable
-curl -O https://raw.githubusercontent.com/yourusername/shed/main/sem-ver/sem-ver
+curl -O https://raw.githubusercontent.com/budhash/shed/main/sem-ver/sem-ver
 chmod +x sem-ver
 ./sem-ver -h
 ```
