@@ -115,14 +115,14 @@ export DEPENDENCY_TOOL="/path/to/dependency"
 ./tool-name/tool-name -h
 
 # Install to PATH
-curl -o /usr/local/bin/tool-name https://raw.githubusercontent.com/yourusername/shed/main/tool-name/tool-name
+curl -o /usr/local/bin/tool-name https://raw.githubusercontent.com/budhash/shed/main/tool-name/tool-name
 chmod +x /usr/local/bin/tool-name
 ```
 
 ### Standalone
 ```bash
 # Download and make executable
-curl -O https://raw.githubusercontent.com/yourusername/shed/main/tool-name/tool-name
+curl -O https://raw.githubusercontent.com/budhash/shed/main/tool-name/tool-name
 chmod +x tool-name
 ./tool-name -h
 ```
