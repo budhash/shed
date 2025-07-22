@@ -8,7 +8,8 @@ A collection of useful tools and scripts in various languages (mainly shell) cov
 ## What's in the shed?
 
 - **[`sem-ver/`](sem-ver/)** - Semantic version bumping and management
-- **[`git-tag/`](git-tag/)** - Git tagging utilities
+- **[`git-tag/`](git-tag/)** - Git tag management with semantic versioning
+- **[`ver-kit/`](ver-kit/)** - Universal version extraction and update toolkit
 - **[`.template/`](.template/)** - Template for creating new tools (also tested)
 
 ## Philosophy
@@ -90,6 +91,21 @@ chmod +x /usr/local/bin/${tool-name}
 
 # Or symlink from local clone
 ln -s $(pwd)/${tool-name}/${tool-name} /usr/local/bin/
+```
+
+## Testing
+
+The shed includes a robust testing framework:
+
+```bash
+# Run lint on all tools
+make lint
+
+# Run all tools' tests
+make test
+
+# Run individual tool tests  
+cd git-tag && ./tests.sh
 ```
 
 ## Requirements
