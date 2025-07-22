@@ -460,11 +460,13 @@ get_yaml_patterns() {
 # Generic function to find version with given patterns
 find_version_with_patterns() {
   local file="$1"
-  shift
-  local patterns=("$@")
+  local pattern_func="$2"
   
+  # Use command substitution and process substitution compatible with bash 3.2
   local pattern
-  for pattern in "${patterns[@]}"; do
+  while IFS= read -r pattern; do
+    [[ -n "$pattern" ]] || continue
+    
     local matching_line
     matching_line=$(grep -m1 "$pattern" "$file" 2>/dev/null) || continue
     
@@ -475,7 +477,7 @@ find_version_with_patterns() {
       echo "$pattern|$matching_line"
       return 0
     fi
-  done
+  done < <("$pattern_func")
   return 1
 }
 
@@ -489,44 +491,28 @@ find_version_with_pattern() {
   
   case "$filename" in
     *.sh|*.bash)
-      local patterns
-      readarray -t patterns < <(get_shell_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_shell_patterns
       ;;
     Package.swift|*.swift)
-      local patterns
-      readarray -t patterns < <(get_swift_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_swift_patterns
       ;;
     *.py)
-      local patterns
-      readarray -t patterns < <(get_python_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_python_patterns
       ;;
     *.java)
-      local patterns
-      readarray -t patterns < <(get_java_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_java_patterns
       ;;
     *.kt|*.kts)
-      local patterns
-      readarray -t patterns < <(get_kotlin_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_kotlin_patterns
       ;;
     package.json|*.json)
-      local patterns
-      readarray -t patterns < <(get_json_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_json_patterns
       ;;
     *.yaml|*.yml)
-      local patterns
-      readarray -t patterns < <(get_yaml_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_yaml_patterns
       ;;
     *)
-      local patterns
-      readarray -t patterns < <(get_shell_patterns)
-      find_version_with_patterns "$file" "${patterns[@]}"
+      find_version_with_patterns "$file" get_shell_patterns
       ;;
   esac
   

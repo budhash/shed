@@ -56,3 +56,4 @@ coverage/
 .bash_history
 .zsh_history
 temp
+.prompt
