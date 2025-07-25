@@ -349,7 +349,6 @@ _cmd_set() {
 
 ##[ functions
 _main() {
-  echo "DEBUG: Starting _main, SEMVER_TOOL='$__SEMVER_TOOL'" >&2
   _validate_git_repo
   
   local opt help=false version=false
