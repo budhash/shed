@@ -11,6 +11,9 @@
 # VERSION: 1.0.0
 # LICENSE: MIT
 # --------------------------------------------------------------------
+# __TEMPLATE__: https://github.com/budhash/zap-sh/blob/main/templates/enhanced.sh
+# __ID__: enhanced-1.0.0
+# --------------------------------------------------------------------
 ##) header
 
 ##( configuration
@@ -18,10 +21,9 @@ set -eEuo pipefail; IFS=$'\n\t'  # fail fast, secure IFS
 ##) configuration
 
 ##( metadata
-readonly __ID="basic-1.0.0"
 readonly __APP="$(basename "${BASH_SOURCE[0]:-}")"
-readonly __APPFILE="${BASH_SOURCE[0]}"
-readonly __APPDIR="$(s="${BASH_SOURCE[0]}"; while [[ -h "$s" ]]; do 
+readonly __APPFILE="${BASH_SOURCE[0]:-}"
+readonly __APPDIR="$(s="${BASH_SOURCE[0]:-}"; while [[ -h "$s" ]]; do 
   d="$(cd -P "$(dirname "$s")" && pwd)"; s="$(readlink "$s")"; [[ "$s" != /* ]] && s="$d/$s"; done; cd -P "$(dirname "$s")" && pwd)"
 __DBG=${DEBUG:-false}
 ##) metadata
