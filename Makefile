@@ -1,7 +1,7 @@
 # Shed - Collection of useful development tools
 # Makefile for common tasks
 
-.PHONY: test help clean lint
+.PHONY: test help clean lint update-templates
 
 # Default target
 .DEFAULT_GOAL := help
@@ -43,6 +43,31 @@ lint:
 		echo "shellcheck not found. Install with: brew install shellcheck (macOS) or apt install shellcheck (Ubuntu)"; \
 		exit 1; \
 	fi
+
+## Update all tool templates using zap-sh
+update-templates:
+	@echo "Updating templates for all tools..."
+	@echo "Updating framework files..."
+	@curl -sL https://raw.githubusercontent.com/budhash/zap-sh/main/zap-sh | \
+		bash -s -- update -y -f .template/tool-template || { \
+			echo "Failed to update .template/tool-template"; \
+			exit 1; \
+		}
+	@echo "Updating tools from tools.txt..."
+	@grep -v '^#' tools.txt | grep -v '^[[:space:]]*$$' | cut -d: -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$$//' | \
+	while read -r tool; do \
+		if [ -f "$$tool/$$tool" ]; then \
+			echo "Updating $$tool/$$tool"; \
+			curl -sL https://raw.githubusercontent.com/budhash/zap-sh/main/zap-sh | \
+				bash -s -- update -y -f "$$tool/$$tool" || { \
+					echo "Failed to update $$tool/$$tool"; \
+					exit 1; \
+				}; \
+		else \
+			echo "Skipping $$tool/$$tool (file not found)"; \
+		fi; \
+	done
+	@echo "Template updates completed"
 
 ## Clean up temporary files and artifacts
 clean:
