@@ -1554,6 +1554,50 @@ pkglib.github.status() {
 }
 ##] github
 
+##( dmg
+##@ dmg validation - mac-only, delegates to download
+##: pkglib.dmg.validate <name> <force> [kwargs...] -> pkglib.dmg.validate "https://example.com/app.dmg" "false" "--dest=/Applications" "--artifact=App.app"
+pkglib.dmg.validate() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+
+  # DMG is macOS only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "linux" ]] && { _error "dmg packages cannot be installed on Linux"; return $_E_OS; }
+
+  # Delegate to download validation
+  pkglib.download.validate "$_name" "$_force" "$@"
+}
+
+##@ dmg installation - delegates to download with type=dmg
+##: pkglib.dmg.install <name> <force> [--key=value...] -> pkglib.dmg.install "https://example.com/app.dmg" true --dest=/Applications --artifact=App.app
+pkglib.dmg.install() {
+  pkglib.download.install "$@" --type=dmg
+}
+
+##@ dmg update - uninstall + install
+##: pkglib.dmg.update <name> <force> [--key=value...] -> pkglib.dmg.update "https://example.com/app.dmg" true --dest=/Applications --artifact=App.app
+pkglib.dmg.update() {
+  pkglib.dmg.uninstall "$@" && pkglib.dmg.install "$@"
+}
+
+##@ dmg uninstallation - delegates to download
+##: pkglib.dmg.uninstall <name> <force> [--key=value...] -> pkglib.dmg.uninstall "https://example.com/app.dmg" false --dest=/Applications --artifact=App.app
+pkglib.dmg.uninstall() {
+  pkglib.download.uninstall "$@"
+}
+
+##@ dmg status - delegates to download
+##: pkglib.dmg.status <name> <force> [--key=value...] -> status=$(pkglib.dmg.status "https://example.com/app.dmg" false --dest=/Applications --artifact=App.app)
+pkglib.dmg.status() {
+  pkglib.download.status "$@"
+}
+##) dmg
+
 ##[ download
 ##@ Validate download package parameters before installation
 ##: pkglib.download.validate <name> <force> [kwargs...] -> pkglib.download.validate "https://raw.../zap-sh" "false" "--dest=/usr/local/bin" "--artifact=zap-sh"

@@ -11,7 +11,7 @@ test_pkglib_loads() {
   assert_ok bash -n ./pkglib "pkglib syntax"
   # shellcheck disable=SC1091
   source ./pkglib
-  local mgrs="brew apt dnf github download mas script cargo go pipx npm cask"
+  local mgrs="brew apt dnf github download mas script cargo go pipx npm cask dmg"
   local ops="validate install update uninstall status"
   local m o
   for m in $mgrs; do for o in $ops; do
@@ -109,6 +109,14 @@ EOF
 
   # Cleanup
   rm -rf "$fake"
+}
+
+test_dmg_handler_delegates() {
+  _section_header "dmg handler delegates to download"
+  source ./pkglib
+  for o in validate install update uninstall status; do
+    assert_ok declare -F pkglib.dmg.$o "pkglib.dmg.$o exists"
+  done
 }
 
 _test_runner
