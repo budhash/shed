@@ -73,6 +73,15 @@ readonly _PKGLIB_GITHUB_API_BASE="https://api.github.com"
 ##) constants
 
 ##( helpers
+##@ Maps a manager name to the CLI tool that implements it (managers without their own binary).
+##: _pkglib.manager_tool <manager> -> tool=$(_pkglib.manager_tool cask)
+_pkglib.manager_tool() {
+  case "$1" in
+    cask) echo "brew" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 ##@ Check if required tool is available
 ##: _pkglib.require_tool <tool> -> _pkglib.require_tool brew
 _pkglib.require_tool() {
@@ -344,7 +353,7 @@ pkglib.common.install() {
   shift 3
   
   local _kwargs=("$@")
-  _pkglib.require_tool "$_manager" || return $_E_DEP
+  _pkglib.require_tool "$(_pkglib.manager_tool "$_manager")" || return $_E_DEP
   
   # Action
   _log "installing package - $_manager: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
@@ -379,7 +388,7 @@ pkglib.common.update() {
   shift 3
   
   local _kwargs=("$@")
-  _pkglib.require_tool "$_manager" || return $_E_DEP
+  _pkglib.require_tool "$(_pkglib.manager_tool "$_manager")" || return $_E_DEP
   
   # Action
   _log "updating package - $_manager: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
@@ -404,7 +413,7 @@ pkglib.common.uninstall() {
   shift 3
   
   local _kwargs=("$@")
-  _pkglib.require_tool "$_manager" || return $_E_DEP
+  _pkglib.require_tool "$(_pkglib.manager_tool "$_manager")" || return $_E_DEP
   
   # Action
   _log "uninstalling package - $_manager: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
@@ -567,82 +576,19 @@ pkglib.cask.execute() {
 ##@ cask installation
 ##: pkglib.cask.install <name> <force> [--key=value...] -> pkglib.cask.install vscode true
 pkglib.cask.install() {
-  local _name="$1" _force="$2"
-  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
-  shift 2
-
-  local _kwargs=("$@")
-  _pkglib.require_tool "brew" || return $_E_DEP
-
-  # Action
-  _log "installing package - cask: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
-
-  # Check if already installed first
-  local _status
-  _status=$(pkglib.cask.status "$_name" "false" "${_kwargs[@]}")
-
-  if [[ "$_status" == "$_PKGLIB_STATUS_INSTALLED" ]]; then
-    if [[ "$_force" == "true" ]]; then
-      # Already installed + force = reinstall
-      pkglib.cask.execute "$_PKGLIB_ACTION_REINSTALL" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
-    else
-      # Already installed + no force = skip
-      _log "already installed: $_name"
-      return 0
-    fi
-  else
-    # Not installed = install (ignore force flag)
-    pkglib.cask.execute "$_PKGLIB_ACTION_INSTALL" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
-  fi
-
-  _log "✓ cask package installed: $_name"
-  return 0
+  pkglib.common.install "cask" "$@"
 }
 
 ##@ cask update (upgrade or reinstall with force)
 ##: pkglib.cask.update <name> <force> [--key=value...] -> pkglib.cask.update vscode true
 pkglib.cask.update() {
-  local _name="$1" _force="$2"
-  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
-  shift 2
-
-  local _kwargs=("$@")
-  _pkglib.require_tool "brew" || return $_E_DEP
-
-  # Action
-  _log "updating package - cask: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
-
-  if [[ "$_force" == "true" ]]; then
-    # Force update = reinstall/force update
-    pkglib.cask.execute "$_PKGLIB_ACTION_REUPDATE" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
-  else
-    # Regular update
-    pkglib.cask.execute "$_PKGLIB_ACTION_UPDATE" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
-  fi
-
-  _log "✓ cask package updated: $_name"
-  return 0
+  pkglib.common.update "cask" "$@"
 }
 
 ##@ cask uninstallation
 ##: pkglib.cask.uninstall <name> <force> [--key=value...] -> pkglib.cask.uninstall vscode false
 pkglib.cask.uninstall() {
-  local _name="$1" _force="$2"
-  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
-  shift 2
-
-  local _kwargs=("$@")
-  _pkglib.require_tool "brew" || return $_E_DEP
-
-  # Action
-  _log "uninstalling package - cask: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
-
-  # Most package managers don't use kwargs for uninstall to avoid failures
-  # Pass all kwargs to execute function for source parameter extraction
-  pkglib.cask.execute "$_PKGLIB_ACTION_UNINSTALL" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
-
-  _log "✓ cask package uninstalled: $_name"
-  return 0
+  pkglib.common.uninstall "cask" "$@"
 }
 
 ##@ cask status
