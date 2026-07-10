@@ -11,6 +11,18 @@ NAME="pkgman"; TOOL="./pkgman"
 # killed CI job with truncated logs).
 exec </dev/null
 
+# TEMPORARY CI DIAGNOSTIC (remove after the macOS-lane kill is found): trace every
+# section + exit into a file that ci.yml dumps in an always() step, immune to the
+# stdout truncation seen when the job dies.
+PKGTRACE="${PKGTRACE:-/tmp/pkgman-trace.log}"
+: > "$PKGTRACE" || PKGTRACE=/dev/null
+echo "SUITE START $(date +%s) bash=$BASH_VERSION" >> "$PKGTRACE"
+trap 'echo "SUITE EXIT code=$? at ${FUNCNAME[0]:-main}" >> "$PKGTRACE"' EXIT
+_section_header() {
+  echo "SECTION: ${1:-?} $(date +%s)" >> "$PKGTRACE"
+  echo -e "${_BLU}Testing: ${1:-?}${_RST}"
+}
+
 # Platform-parameterized fixtures: the committed mocks/fixture*.manifest are
 # mac-flavored EXAMPLES. CI also runs on linux, where mac-tagged rows are
 # (correctly) filtered by _tags_match — so mac-hardcoded expectations fail there.
@@ -176,7 +188,7 @@ test_manifest_install() {
   assert_ok test ! -f "$MOCK_STATE/gamma" "laptop-tagged row filtered out"
   assert_ok test ! -f "$MOCK_STATE/delta" "linux-tagged row filtered out on mac"
 
-  assert_ok grep -q '^beta.tags=mac,macmini' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "tags persisted"
+  assert_ok grep -q "^beta.tags=${THIS_OS},macmini" "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "tags persisted"
   assert_ok grep -q '^beta.manager=script' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "manager metadata persisted"
   assert_ok grep -q '^epsilon.version=1.2.3' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "applicable row's version= kwarg lands in the index"
   assert_ok grep -q '^beta.install_method=pkgman' "$PKGMAN_CONFIG_DIR/status.cfg" "install_method=pkgman recorded"
