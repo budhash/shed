@@ -360,12 +360,12 @@ pkglib.common.install() {
   
   # Check if already installed first
   local _status
-  _status=$(pkglib.${_manager}.status "$_name" "false" "${_kwargs[@]}")
-  
+  _status=$(pkglib.${_manager}.status "$_name" "false" "${_kwargs[@]+"${_kwargs[@]}"}")
+
   if [[ "$_status" == "$_PKGLIB_STATUS_INSTALLED" ]]; then
     if [[ "$_force" == "true" ]]; then
       # Already installed + force = reinstall
-      pkglib.${_manager}.execute "$_PKGLIB_ACTION_REINSTALL" "$_name" "${_kwargs[@]}" || { _error "$_manager execute failed"; return $_E; }
+      pkglib.${_manager}.execute "$_PKGLIB_ACTION_REINSTALL" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
     else
       # Already installed + no force = skip
       _log "already installed: $_name"
@@ -373,7 +373,7 @@ pkglib.common.install() {
     fi
   else
     # Not installed = install (ignore force flag)
-    pkglib.${_manager}.execute "$_PKGLIB_ACTION_INSTALL" "$_name" "${_kwargs[@]}" || { _error "$_manager execute failed"; return $_E; }
+    pkglib.${_manager}.execute "$_PKGLIB_ACTION_INSTALL" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
   fi
   
   _log "✓ $_manager package installed: $_name"
@@ -395,10 +395,10 @@ pkglib.common.update() {
   
   if [[ "$_force" == "true" ]]; then
     # Force update = reinstall/force update
-    pkglib.${_manager}.execute "$_PKGLIB_ACTION_REUPDATE" "$_name" "${_kwargs[@]}" || { _error "$_manager execute failed"; return $_E; }
+    pkglib.${_manager}.execute "$_PKGLIB_ACTION_REUPDATE" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
   else
     # Regular update
-    pkglib.${_manager}.execute "$_PKGLIB_ACTION_UPDATE" "$_name" "${_kwargs[@]}" || { _error "$_manager execute failed"; return $_E; }
+    pkglib.${_manager}.execute "$_PKGLIB_ACTION_UPDATE" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
   fi
   
   _log "✓ $_manager package updated: $_name"
@@ -420,7 +420,7 @@ pkglib.common.uninstall() {
   
   # Most package managers don't use kwargs for uninstall to avoid failures
   # Pass all kwargs to execute function for source parameter extraction
-  pkglib.${_manager}.execute "$_PKGLIB_ACTION_UNINSTALL" "$_name" "${_kwargs[@]}" || { _error "$_manager execute failed"; return $_E; }
+  pkglib.${_manager}.execute "$_PKGLIB_ACTION_UNINSTALL" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
   
   _log "✓ $_manager package uninstalled: $_name"
   return 0
