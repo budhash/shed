@@ -20,6 +20,7 @@ echo "SUITE START $(date +%s) bash=$BASH_VERSION" >> "$PKGTRACE"
 trap 'echo "SUITE EXIT code=$? at ${FUNCNAME[0]:-main}" >> "$PKGTRACE"' EXIT
 _section_header() {
   echo "SECTION: ${1:-?} $(date +%s)" >> "$PKGTRACE"
+  # shellcheck disable=SC2154  # _BLU/_RST are assigned by ../.common/test-common at source time
   echo -e "${_BLU}Testing: ${1:-?}${_RST}"
 }
 
