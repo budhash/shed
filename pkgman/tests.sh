@@ -181,4 +181,41 @@ test_manifest_install() {
   assert_fail $TOOL install ./mocks/fixture.manifest "manifest without --host fails"
 }
 
+test_sync_prune() {
+  _section_header "P1: sync --prune converges, never touches manual"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "manifest install runs (alpha+beta+epsilon in)"
+  assert_ok $TOOL add script manual1 --source "$PWD/mocks/mock-pkg" --detail m --name=manual1 "manual1 tracked add-only (never installed via pkgman)"
+
+  # Honest precondition (the brief assumes add-only => literal install_method=manual;
+  # in reality nothing sets install_method until a successful `install`, so an
+  # add-only package has NO install_method key at all yet - see report). Either way
+  # the property this safety test actually depends on is "not install_method=pkgman",
+  # so that's what we assert here, against the real status file.
+  assert_fail grep -q '^manual1.install_method=pkgman' "$PKGMAN_CONFIG_DIR/status.cfg" "manual1 precondition: not install_method=pkgman"
+
+  # sync manifest-B (beta row removed): report-only without --prune
+  local out; out=$($TOOL sync ./mocks/fixture-b.manifest --host macmini 2>&1)
+  assert_contains "$out" "beta" "undeclared beta reported"
+  assert_file_exists "$MOCK_STATE/beta" "beta NOT removed without --prune"
+  assert_ok grep -q '^beta.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "beta still tracked without --prune"
+
+  # --dry-run --prune: prints the plan, performs no removal
+  local dryout; dryout=$($TOOL sync ./mocks/fixture-b.manifest --host macmini --prune --dry-run 2>&1)
+  assert_contains "$dryout" "beta" "dry-run prune plan mentions beta"
+  assert_file_exists "$MOCK_STATE/beta" "beta NOT removed under --dry-run --prune"
+  assert_ok grep -q '^beta.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "beta still tracked under --dry-run --prune"
+
+  # real prune, --force skips the confirm: beta uninstalled + untracked; alpha + manual1 untouched
+  assert_ok $TOOL sync ./mocks/fixture-b.manifest --host macmini --prune --force "prune runs"
+  assert_ok test ! -f "$MOCK_STATE/beta" "beta uninstalled"
+  assert_fail grep -q '^beta.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "beta untracked"
+  assert_file_exists "$MOCK_STATE/alpha" "alpha survives"
+  assert_ok grep -q '^manual1.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "manual package never pruned"
+
+  # sync <manifest> without --host fails, same contract as install <manifest>
+  assert_fail $TOOL sync ./mocks/fixture-b.manifest "sync manifest without --host fails"
+}
+
 _test_runner

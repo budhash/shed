@@ -110,6 +110,8 @@ readonly PKGMAN_DEFAULT_SCOPE="$PKGMAN_SCOPE_CORE"
 _DRY_RUN=false
 _NO_TRACK=false
 _HOST=""
+_PRUNE=false
+_FORCE=false
 
 # Status constants
 readonly _PKGMAN_STATUS_INSTALLED="installed"
@@ -163,6 +165,19 @@ _main() {
         _HOST="${1#*=}"
         shift
         ;;
+      --prune)
+        _PRUNE=true
+        shift
+        ;;
+      --force)
+        # Global mirror of the per-command --force flag (used by manifest sync's
+        # prune confirmation). Left in _args too so existing per-command
+        # _parse_force_flag call sites (uninstall/remove/install-all/etc.) keep
+        # seeing it unchanged - this is additive, not a replacement.
+        _FORCE=true
+        _args+=("$1")
+        shift
+        ;;
       -h|--help) _help; exit 0 ;;
       -v|--version) _version; exit 0 ;;
       *) _args+=("$1"); shift ;;
@@ -210,7 +225,15 @@ _main() {
     remove) _cmd_remove "$@" ;;
     status) _cmd_status "$@" ;;
     info) _cmd_status "$@" ;;
-    sync) _cmd_sync "$@" ;;
+    sync)
+      if [[ -f "${1:-}" ]]; then
+        # Manifest mode: <path> is an existing file, not a tracked package name
+        [[ -n "$_HOST" ]] || { u.error "--host required for manifest mode (sync <manifest> --host <h> [--prune])"; exit $_E_USG; }
+        _manifest_sync "$1" "$(loam.os)" "$_HOST" "$_PRUNE"
+        exit $?
+      fi
+      _cmd_sync "$@"
+      ;;
     # Batch operations
     install-all) _cmd_install_all "$@" ;;
     sync-all) _cmd_sync_all "$@" ;;
@@ -512,6 +535,86 @@ _manifest_apply() {
 
   u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler)"
   return 0
+}
+
+##@ List the names of every manifest row applicable to the given os/host.
+##@ Applies the same filters as _manifest_apply: '#'-comments and blank lines
+##@ are skipped, and rows with an unknown handler are skipped (silently here -
+##@ _manifest_apply already warns about them when actually applying).
+##@ Usage: _declared="$(_manifest_declared_names <file> <os> <host>)"
+_manifest_declared_names() {  # $1=file $2=os $3=host -> applicable names, one per line
+  local _file="$1" _os="$2" _host="$3"
+  local _name _handler _desc _params _tags
+  while IFS='|' read -r _name _handler _desc _params _tags; do
+    _name="$(_manifest_trim "${_name:-}")"
+    [[ -z "$_name" ]] && continue
+    case "$_name" in \#*) continue ;; esac
+
+    _handler="$(_manifest_trim "${_handler:-}")"
+    _tags="$(_manifest_trim "${_tags:-}")"
+
+    _tags_match "$_tags" "$_os" "$_host" </dev/null || continue
+    _normalize_and_validate_manager "$_handler" >/dev/null 2>/dev/null </dev/null || continue
+
+    echo "$_name"
+  done < "$_file"
+  return 0
+}
+
+##@ Converge tracked state against a manifest: apply installs, then (iff prune)
+##@ remove tracking+installation for every install_method=pkgman package in
+##@ scope core that is no longer declared by the manifest for this os/host.
+##@ NEVER touches install_method=manual packages or non-core scopes - those
+##@ are simply invisible to this function (filtered via _get_packages_by_scope
+##@ + the install_method check below).
+##@ Usage: _manifest_sync <file> <os> <host> <prune:true|false>
+_manifest_sync() {
+  local _file="$1" _os="$2" _host="$3" _prune="${4:-false}"
+  _manifest_apply "$_file" "$_os" "$_host" install || return $?
+
+  local _declared="$(_manifest_declared_names "$_file" "$_os" "$_host")"
+
+  local _core_packages
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _core_packages=($(_get_packages_by_scope "$PKGMAN_SCOPE_CORE" </dev/null))
+
+  local _pkg _undeclared=()
+  for _pkg in "${_core_packages[@]+"${_core_packages[@]}"}"; do
+    [[ -z "$_pkg" ]] && continue
+    grep -qx "$_pkg" <<< "$_declared" && continue
+    local _method="$(_get_status "$_pkg" "$_PKGMAN_FIELD_INSTALL_METHOD" </dev/null)"
+    [[ "$_method" == "$_PKGMAN_INSTALL_METHOD_PKGMAN" ]] || continue
+    _undeclared+=("$_pkg")
+  done
+
+  if [[ ${#_undeclared[@]} -eq 0 ]]; then
+    u.info "✓ sync: converged (nothing undeclared)"
+    return 0
+  fi
+
+  u.warn "undeclared pkgman-managed package(s): ${_undeclared[*]}"
+
+  if [[ "$_prune" != "true" ]]; then
+    u.info "run again with --prune to remove them"
+    return 0
+  fi
+
+  _dry "prune: ${_undeclared[*]}" && return 0
+
+  if [[ "$_FORCE" != "true" ]]; then
+    loam.confirm "prune ${#_undeclared[@]} undeclared package(s): ${_undeclared[*]}?" || { u.info "prune cancelled"; return 0; }
+  fi
+
+  local _result=0
+  for _pkg in "${_undeclared[@]}"; do
+    if _cmd_uninstall "$_pkg" </dev/null && _cmd_remove "$_pkg" --force </dev/null; then
+      u.info "✓ pruned $_pkg"
+    else
+      u.error "✗ failed to prune $_pkg"
+      _result=1
+    fi
+  done
+  return $_result
 }
 
 ##@ Parse force flag from arguments with unknown option handling
@@ -1949,7 +2052,11 @@ COMMANDS:
     status <package>                    Show complete package information and metadata
     info <package>                      Alias for status command
     sync <package> [--force]            Sync tracked status with actual installation state
-    
+    sync <manifest> --host <h> [--prune]
+                                        Converge: apply the manifest, then report (or, with
+                                        --prune, remove) tracked install_method=pkgman core
+                                        packages no longer declared by it
+
     # Batch Operations  
     install-all [--force]               Install all missing tracked packages (core scope only)
     sync-all [--force]                  Sync status for all tracked packages (core + system scopes)
@@ -1966,12 +2073,15 @@ GLOBAL OPTIONS:
     -r, --dry-run       Preview actions without making changes
     --dry-run=cmd       Skip package operations but update state files (for testing)
     --no-track          Disable state tracking (for one-off operations)
-    --host <h>          Target host tag for manifest mode (REQUIRED with install <manifest>)
+    --host <h>          Target host tag for manifest mode (REQUIRED with install/sync <manifest>)
+    --prune             With sync <manifest>: remove undeclared pkgman-managed core packages
+                          (report-only without this flag)
     -h, --help          Show this help
     -v, --version       Show version
 
 COMMAND OPTIONS:
-    --force             Force operation (reinstall, ignore status, etc.)
+    --force             Force operation (reinstall, ignore status, etc.); for sync <manifest>
+                          --prune, skips the single confirmation prompt
 
 ADD COMMAND PARAMETERS:
     <manager>           Package manager: brew, apt, dnf, github, download, mas, script, cargo, go, pipx, npm
