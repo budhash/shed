@@ -1,3 +1,10 @@
+#!/usr/bin/env bash
+# loam is a LIBRARY — source it; direct execution is refused.
+if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
+  echo "loam: this is a library — 'source loam', do not execute it" >&2
+  exit 64
+fi
+
 ##( header
 # --------------------------------------------------------------------
 # radix - core utility function library
