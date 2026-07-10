@@ -218,4 +218,32 @@ test_sync_prune() {
   assert_fail $TOOL sync ./mocks/fixture-b.manifest "sync manifest without --host fails"
 }
 
+test_sync_prune_typo_handler_fails_safe() {
+  _section_header "P1: sync --prune - typo'd handler still declares its package (fails safe)"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "manifest install runs (alpha+beta+epsilon in)"
+  assert_file_exists "$MOCK_STATE/alpha" "alpha installed before the typo'd re-sync"
+
+  # Same rows as fixture.manifest, but alpha's handler is typo'd ('scritp' for
+  # 'script'). A parse problem (unknown handler) must never escalate into a
+  # destructive prune: _manifest_apply will warn+skip the row (can't install
+  # it), but _manifest_declared_names must still count alpha as declared, so
+  # prune leaves the already-installed/tracked package alone.
+  local _typo; _typo=$(mktemp "${TMPDIR:-/tmp}/typo-manifest-XXXXXX")
+  cat > "$_typo" <<'EOF'
+alpha     | scritp  | mock A        | source=./mocks/mock-pkg!name=alpha  |
+beta      | script  | mock B        | source=./mocks/mock-pkg!name=beta   | mac,macmini
+gamma     | script  | mock C        | source=./mocks/mock-pkg!name=gamma  | mac,laptop
+delta     | brew    | not for v-run | version=9.9.9                       | linux
+epsilon   | script  | mock E        | source=./mocks/mock-pkg!name=epsilon!version=1.2.3 |
+EOF
+
+  local out; out=$($TOOL sync "$_typo" --host macmini --prune --force 2>&1)
+  assert_contains "$out" "unknown handler" "apply still warns about the typo'd handler"
+  assert_file_exists "$MOCK_STATE/alpha" "alpha marker survives despite typo'd handler"
+  assert_ok grep -q '^alpha.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "alpha still tracked in the index"
+  rm -f "$_typo"
+}
+
 _test_runner

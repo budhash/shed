@@ -538,9 +538,13 @@ _manifest_apply() {
 }
 
 ##@ List the names of every manifest row applicable to the given os/host.
-##@ Applies the same filters as _manifest_apply: '#'-comments and blank lines
-##@ are skipped, and rows with an unknown handler are skipped (silently here -
-##@ _manifest_apply already warns about them when actually applying).
+##@ Applies the same '#'-comment/blank-line and _tags_match filters as
+##@ _manifest_apply, but deliberately does NOT skip rows with an unknown
+##@ handler: a row still DECLARES its name (column 1) for prune-protection
+##@ purposes even if its handler is unrecognized (e.g. a typo). A parse
+##@ problem must never escalate into a destructive `sync --prune` removal -
+##@ _manifest_apply already warns+skips the bad-handler row for install
+##@ purposes, so the two functions are intentionally asymmetric here.
 ##@ Usage: _declared="$(_manifest_declared_names <file> <os> <host>)"
 _manifest_declared_names() {  # $1=file $2=os $3=host -> applicable names, one per line
   local _file="$1" _os="$2" _host="$3"
@@ -550,11 +554,9 @@ _manifest_declared_names() {  # $1=file $2=os $3=host -> applicable names, one p
     [[ -z "$_name" ]] && continue
     case "$_name" in \#*) continue ;; esac
 
-    _handler="$(_manifest_trim "${_handler:-}")"
     _tags="$(_manifest_trim "${_tags:-}")"
 
     _tags_match "$_tags" "$_os" "$_host" </dev/null || continue
-    _normalize_and_validate_manager "$_handler" >/dev/null 2>/dev/null </dev/null || continue
 
     echo "$_name"
   done < "$_file"
