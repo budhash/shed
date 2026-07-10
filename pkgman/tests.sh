@@ -49,4 +49,28 @@ test_add_and_install() {
   assert_contains "$($TOOL status demo 2>&1)" "installed" "status sees installed"
 }
 
+test_smoke_all_subcommands() {
+  _section_header "P0: --dry-run=cmd smoke across the router"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+  $TOOL add script demo --source "$PWD/mocks/mock-pkg" --detail demo --name=demo >/dev/null
+
+  local c
+  for c in list-all list-packages list-scopes "status demo" "info demo" \
+           "install demo" "update demo" "sync demo" "uninstall demo" \
+           install-all update-all sync-all "remove demo"; do
+    # shellcheck disable=SC2086  # intentional word-splitting: $c is a command+args string built above
+    assert_ok $TOOL --dry-run=cmd $c "dry-run=cmd: $c"
+  done
+
+  # provision brew resolves its "pkgboot" script source via pkglib's search path
+  # (../bin, ../ins, $HOME/.local/bin, /usr/local/bin, PATH) - none of which include
+  # this repo's pkgman/pkgboot. Make the test hermetic with a scratch HOME instead of
+  # touching the real ~/.local/bin (see Task 5's report for the same finding).
+  local _scratch_home; _scratch_home=$(mktemp -d "${TMPDIR:-/tmp}/pkgboot-home-XXXXXX")
+  mkdir -p "$_scratch_home/.local/bin"
+  ln -s "$PWD/pkgboot" "$_scratch_home/.local/bin/pkgboot"
+  HOME="$_scratch_home" assert_ok $TOOL --dry-run=cmd provision brew "dry-run=cmd: provision brew"
+}
+
 _test_runner
