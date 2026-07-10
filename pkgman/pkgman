@@ -94,7 +94,7 @@ readonly PKGMAN_RESOLVED_FILE="$PKGMAN_CONFIG_DIR/.resolved.cfg"
 readonly PKGMAN_STATUS_FILE="$PKGMAN_CONFIG_DIR/status.cfg"
 
 # Supported package managers with required operations
-readonly PKGMAN_MANAGERS=(brew apt dnf github download mas script cargo go pipx npm)
+readonly PKGMAN_MANAGERS=(brew apt dnf github download mas script cargo go pipx npm cask)
 readonly PKGMAN_OPERATIONS=(validate install update uninstall status)
 
 # Core metadata fields (excluded from kwargs extraction)

@@ -11,7 +11,7 @@ test_pkglib_loads() {
   assert_ok bash -n ./pkglib "pkglib syntax"
   # shellcheck disable=SC1091
   source ./pkglib
-  local mgrs="brew apt dnf github download mas script cargo go pipx npm"
+  local mgrs="brew apt dnf github download mas script cargo go pipx npm cask"
   local ops="validate install update uninstall status"
   local m o
   for m in $mgrs; do for o in $ops; do
@@ -82,6 +82,33 @@ test_smoke_all_subcommands() {
   mkdir -p "$_scratch_home/.local/bin"
   ln -s "$PWD/pkgboot" "$_scratch_home/.local/bin/pkgboot"
   HOME="$_scratch_home" assert_ok $TOOL --dry-run=cmd provision brew "dry-run=cmd: provision brew"
+}
+
+test_cask_handler() {
+  _section_header "cask handler via fake brew"
+  source ./pkglib
+  local fake; fake=$(mktemp -d "${TMPDIR:-/tmp}/fakebrew-XXXXXX")
+  cat > "$fake/brew" <<'EOF'
+#!/bin/bash
+echo "BREW $*" >> "${FAKE_BREW_LOG:?}"
+case "$1" in list) exit 1;; *) exit 0;; esac
+EOF
+  chmod +x "$fake/brew"
+  export FAKE_BREW_LOG="$fake/log"
+
+  # Save original PATH and restore it after test
+  local _orig_path="$PATH"
+  PATH="$fake:$PATH"
+
+  pkglib.cask.install somecask false >/dev/null 2>&1 || true
+  assert_ok grep -q 'BREW install --cask somecask' "$FAKE_BREW_LOG" "install maps to brew install --cask"
+  assert_eq "missing" "$(pkglib.cask.status somecask false)" "status missing when list fails"
+
+  # Restore PATH
+  PATH="$_orig_path"
+
+  # Cleanup
+  rm -rf "$fake"
 }
 
 _test_runner

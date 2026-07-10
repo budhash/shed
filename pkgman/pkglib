@@ -506,6 +506,159 @@ pkglib.brew.uninstall() {
 }
 ##] brew
 
+##[ cask
+##@ Validate cask package parameters before installation
+##: pkglib.cask.validate <name> <force> [kwargs...] -> pkglib.cask.validate vscode true
+pkglib.cask.validate() {
+  local _name="$1" _force="$2"  # _name is cask name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+
+  # Cask is macOS only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "linux" ]] && { _error "cask packages cannot be installed on Linux"; return $_E_OS; }
+
+  # Verify brew is available (cask requires Homebrew)
+  loam.has brew || { _error "cask requires Homebrew"; return $_E_DEP; }
+
+  return 0
+}
+
+##@ cask command execution with kwargs handling
+##: pkglib.cask.execute <action> <name> [kwargs...] -> pkglib.cask.execute install vscode
+pkglib.cask.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+
+  local _command _append_kwargs=true
+
+  # Map pkglib actions to brew cask commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="reinstall" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="upgrade" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="reinstall"; _append_kwargs=false ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall"; _append_kwargs=false ;;
+    *) _error "cask: unknown action $_action"; return $_E ;;
+  esac
+
+  # Execute brew cask command with or without kwargs
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+    _debug "brew $_command --cask $_name ${_filtered_kwargs[@]}"
+    brew "$_command" --cask "$_name" "${_filtered_kwargs[@]}" || { _error "brew $_command --cask failed: $_name"; return $_E; }
+  else
+    _debug "brew $_command --cask $_name"
+    brew "$_command" --cask "$_name" || { _error "brew $_command --cask failed: $_name"; return $_E; }
+  fi
+
+  return 0
+}
+
+##@ cask installation
+##: pkglib.cask.install <name> <force> [--key=value...] -> pkglib.cask.install vscode true
+pkglib.cask.install() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 2
+
+  local _kwargs=("$@")
+  _pkglib.require_tool "brew" || return $_E_DEP
+
+  # Action
+  _log "installing package - cask: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+
+  # Check if already installed first
+  local _status
+  _status=$(pkglib.cask.status "$_name" "false" "${_kwargs[@]}")
+
+  if [[ "$_status" == "$_PKGLIB_STATUS_INSTALLED" ]]; then
+    if [[ "$_force" == "true" ]]; then
+      # Already installed + force = reinstall
+      pkglib.cask.execute "$_PKGLIB_ACTION_REINSTALL" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
+    else
+      # Already installed + no force = skip
+      _log "already installed: $_name"
+      return 0
+    fi
+  else
+    # Not installed = install (ignore force flag)
+    pkglib.cask.execute "$_PKGLIB_ACTION_INSTALL" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
+  fi
+
+  _log "✓ cask package installed: $_name"
+  return 0
+}
+
+##@ cask update (upgrade or reinstall with force)
+##: pkglib.cask.update <name> <force> [--key=value...] -> pkglib.cask.update vscode true
+pkglib.cask.update() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 2
+
+  local _kwargs=("$@")
+  _pkglib.require_tool "brew" || return $_E_DEP
+
+  # Action
+  _log "updating package - cask: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+
+  if [[ "$_force" == "true" ]]; then
+    # Force update = reinstall/force update
+    pkglib.cask.execute "$_PKGLIB_ACTION_REUPDATE" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
+  else
+    # Regular update
+    pkglib.cask.execute "$_PKGLIB_ACTION_UPDATE" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
+  fi
+
+  _log "✓ cask package updated: $_name"
+  return 0
+}
+
+##@ cask uninstallation
+##: pkglib.cask.uninstall <name> <force> [--key=value...] -> pkglib.cask.uninstall vscode false
+pkglib.cask.uninstall() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 2
+
+  local _kwargs=("$@")
+  _pkglib.require_tool "brew" || return $_E_DEP
+
+  # Action
+  _log "uninstalling package - cask: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+
+  # Most package managers don't use kwargs for uninstall to avoid failures
+  # Pass all kwargs to execute function for source parameter extraction
+  pkglib.cask.execute "$_PKGLIB_ACTION_UNINSTALL" "$_name" "${_kwargs[@]}" || { _error "cask execute failed"; return $_E; }
+
+  _log "✓ cask package uninstalled: $_name"
+  return 0
+}
+
+##@ cask status
+##: pkglib.cask.status <name> <force> [--key=value...] -> status=$(pkglib.cask.status vscode false)
+pkglib.cask.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "brew" || return $_E_DEP
+
+  # Action - status checking doesn't need kwargs
+  _debug "brew list --cask --versions $_name"
+  brew list --cask --versions "$_name" >/dev/null 2>&1 && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] cask
+
 ##[ apt
 ##@ Validate apt package parameters before installation
 ##: pkglib.apt.validate <name> <force> [kwargs...] -> pkglib.apt.validate nginx true
