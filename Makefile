@@ -30,15 +30,24 @@ help:
 lint:
 	@echo "Linting shell scripts..."
 	@if command -v shellcheck >/dev/null 2>&1; then \
+		fail=0; \
 		echo "Linting framework files..."; \
-		shellcheck .common/test-driver .common/test-common .template/tool-template; \
+		shellcheck .common/test-driver .common/test-common .template/tool-template || fail=1; \
 		echo "Linting tools from tools.txt..."; \
-		grep -v '^#' tools.txt | grep -v '^[[:space:]]*$$' | cut -d: -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$$//' | grep -v '.template' | \
+		tools=$$(grep -v '^#' tools.txt | grep -v '^[[:space:]]*$$' | cut -d: -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$$//' | grep -v '.template'); \
 		while read -r tool; do \
-			echo "Linting $$tool/$$tool"; \
-			shellcheck "$$tool/$$tool"; \
-		done; \
+			[ -z "$$tool" ] && continue; \
+			base=$$(basename "$$tool"); \
+			echo "Linting $$tool/$$base"; \
+			shellcheck "$$tool/$$base" || fail=1; \
+		done <<< "$$tools"; \
+		echo "Linting pkgman extras"; \
+		shellcheck pkgman/pkglib pkgman/pkgboot || fail=1; \
 		echo "Linting completed"; \
+		if [ "$$fail" -ne 0 ]; then \
+			echo "Linting failed"; \
+			exit 1; \
+		fi; \
 	else \
 		echo "shellcheck not found. Install with: brew install shellcheck (macOS) or apt install shellcheck (Ubuntu)"; \
 		exit 1; \

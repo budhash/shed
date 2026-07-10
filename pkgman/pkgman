@@ -1,0 +1,2226 @@
+#!/usr/bin/env bash
+##( header
+# --------------------------------------------------------------------
+# pkgman - Universal package manager CLI
+#
+# Stateful wrapper for pkglib providing auto-detection, state management,
+# and simplified package operations across different package managers.
+# Tracks installations in configuration files and provides convenience
+# commands for day-to-day package management.
+# --------------------------------------------------------------------
+# AUTHOR: Budha <budhash@gmail.com>
+# VERSION: 1.0.0
+# LICENSE: MIT License
+# --------------------------------------------------------------------
+# __TEMPLATE__: https://github.com/budhash/zap-sh/blob/main/templates/basic.sh
+# __ID__: basic-1.0.0
+# --------------------------------------------------------------------
+##) header
+# shellcheck disable=SC1090 # pkglib is sourced from a runtime-resolved path (same-dir first, then legacy/env fallbacks); location can't be known statically. verified live by tests.sh
+##( configuration
+set -eEuo pipefail; IFS=$'\n\t'  # fail fast, secure IFS
+##) configuration
+##( metadata
+readonly __SOURCE="${BASH_SOURCE[0]:-}"
+readonly __PIPED=$([[ -t 0 || -n "$__SOURCE" ]] && echo false || echo true)
+readonly __APP="$(basename "${__SOURCE:-$0}")"
+readonly __APPFILE="$__SOURCE"
+if [[ -n "$__SOURCE" ]]; then
+  readonly __APPDIR="$(s="$__SOURCE"; while [[ -h "$s" ]]; do
+    d="$(cd -P "$(dirname "$s")" && pwd)"; s="$(readlink "$s")"; [[ "$s" != /* ]] && s="$d/$s"; done; cd -P "$(dirname "$s")" && pwd)"
+else
+  readonly __APPDIR="$(pwd)"
+fi
+__DBG=${DEBUG:-false}
+##) metadata
+##( globals
+
+##[ colors
+_RST=$'\033[0m' _GRN=$'\033[0;32m' _YLW=$'\033[0;33m' _RED=$'\033[0;31m' _BLU=$'\033[0;34m'
+[[ -n "${NO_COLOR:-}" || ! -t 1 ]] && _RST='' _GRN='' _YLW='' _RED='' _BLU=''
+##] colors
+
+##[ error
+# general failure / bad usage / dependency not found / unsupported OS / not found / permission error / not connected / piped mode
+_E=1 _E_USG=2 _E_DEP=3 _E_OS=4 _E_NF=5 _E_NP=6 _E_NC=7 _E_PIPE=8
+##] error
+
+##) globals
+##( helpers
+
+##[ system
+u.os() { case "${OSTYPE:-}" in darwin*) echo mac;; linux*) echo linux;; *) echo unknown;; esac; }
+u.die() { u.error "$@"; exit $_E; }
+u.require() {
+  local tool="${1:-}"
+  [[ -z "$tool" ]] && { u.error "missing dependency name"; exit $_E_DEP; }
+  if [[ "$tool" == /* ]] || [[ "$tool" == ./* ]] || [[ "$tool" == ../* ]]; then
+    [[ -x "$tool" ]] || { u.error "missing dependency: $tool"; exit $_E_DEP; } # Absolute or relative path - test directly
+  else
+    command -v "$tool" >/dev/null || { u.error "missing dependency: $tool"; exit $_E_DEP; }
+  fi
+}
+##] system
+
+##[ logging
+u.log() {
+  local _l="info " _co="$_GRN"
+  [[ "${1:-}" == "-l" ]] && { _l="${2:-info}"; shift 2; }
+  case "$_l" in warn) _co="$_YLW";; error) _co="$_RED";; debug) _co="$_BLU"; [[ "$__DBG" != true ]] && return;; esac
+  printf "${_co}[%s]${_RST} %s\n" "$_l" "$*" >&2
+  return 0
+}
+u.info() { u.log -l "info " "$@"; }
+u.warn() { u.log -l "warn " "$@"; }
+u.error() { u.log -l "error" "$@"; }
+u.debug() { u.log -l "debug" "$@"; }
+##] logging
+
+##) helpers
+##( app
+
+##[ config
+readonly __NAME=pkgman
+readonly __OS=(mac linux)
+readonly __APP_DEPS=(find)
+readonly __ALLOW_PIPED=false  # Package manager should not run in piped mode
+##] config
+
+##[ constants
+# Configuration file paths
+readonly PKGMAN_CONFIG_DIR="${PKGMAN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pkgman}"
+readonly PKGMAN_INDEX_DIR="$PKGMAN_CONFIG_DIR/index"
+readonly PKGMAN_RESOLVED_FILE="$PKGMAN_CONFIG_DIR/.resolved.cfg"
+readonly PKGMAN_STATUS_FILE="$PKGMAN_CONFIG_DIR/status.cfg"
+
+# Supported package managers with required operations
+readonly PKGMAN_MANAGERS=(brew apt dnf github download mas script cargo go pipx npm cask dmg)
+readonly PKGMAN_OPERATIONS=(validate install update uninstall status)
+
+# Core metadata fields (excluded from kwargs extraction)
+readonly PKGMAN_CORE_METADATA=(manager source dest artifact channel scope os sudo detail tags)
+
+# Scope constants
+readonly PKGMAN_SCOPE_CORE="core"
+readonly PKGMAN_SCOPE_SYSTEM="system" 
+readonly PKGMAN_SCOPE_MANAGER="manager"
+readonly PKGMAN_DEFAULT_SCOPE="$PKGMAN_SCOPE_CORE"
+
+# Global flags
+_DRY_RUN=false
+_NO_TRACK=false
+_HOST=""
+_PRUNE=false
+_FORCE=false
+
+# Status constants
+readonly _PKGMAN_STATUS_INSTALLED="installed"
+readonly _PKGMAN_STATUS_MISSING="missing"
+readonly _PKGMAN_STATUS_UNKNOWN="unknown"
+
+# Install method constants
+readonly _PKGMAN_INSTALL_METHOD_MANUAL="manual"
+readonly _PKGMAN_INSTALL_METHOD_PKGMAN="pkgman"
+
+# Status field keys
+readonly _PKGMAN_FIELD_STATUS="status"
+readonly _PKGMAN_FIELD_INSTALL_METHOD="install_method" 
+readonly _PKGMAN_FIELD_INSTALLED_AT="installed_at"
+readonly _PKGMAN_FIELD_LAST_CHECKED="last_checked"
+
+# Magic strings
+readonly _PKGMAN_ERROR_MSG_ADD_TO_TRACK="use 'pkgman add' to track existing packages"
+##] constants
+
+##[ functions
+_main() {
+  # Parse global flags first
+  local _args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -r|--dry-run)
+        _DRY_RUN=true
+        _NO_TRACK=true
+        shift
+        ;;
+      --dry-run=*)
+        local _dry_val="${1#*=}"
+        _DRY_RUN=true
+        case "$_dry_val" in
+          cmd) _NO_TRACK=false ;;
+          *) _NO_TRACK=true ;;
+        esac
+        shift
+        ;;
+      --no-track)
+        _NO_TRACK=true
+        shift
+        ;;
+      --host)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--host requires a value"; exit $_E_USG; }
+        _HOST="$2"
+        shift 2
+        ;;
+      --host=*)
+        _HOST="${1#*=}"
+        shift
+        ;;
+      --prune)
+        _PRUNE=true
+        shift
+        ;;
+      --force)
+        # Global mirror of the per-command --force flag (used by manifest sync's
+        # prune confirmation). Left in _args too so existing per-command
+        # _parse_force_flag call sites (uninstall/remove/install-all/etc.) keep
+        # seeing it unchanged - this is additive, not a replacement.
+        _FORCE=true
+        _args+=("$1")
+        shift
+        ;;
+      -h|--help) _help; exit 0 ;;
+      -v|--version) _version; exit 0 ;;
+      *) _args+=("$1"); shift ;;
+    esac
+  done
+  set -- "${_args[@]:-}"
+  
+  # Show dry-run notice
+  if [[ "$_DRY_RUN" == "true" ]]; then
+    if [[ "$_NO_TRACK" == "false" ]]; then
+      u.info "DRY RUN MODE (cmd-only) - package operations skipped, state changes applied"
+    else
+      u.info "DRY RUN MODE - no changes will be made"
+    fi
+  fi
+  
+  # Show no-track notice
+  if [[ "$_NO_TRACK" == "true" ]]; then
+    u.info "NO TRACK MODE - state tracking disabled"
+  fi
+  
+  # Load pkglib library
+  _load_pkglib
+  
+  # Parse command and arguments
+  local _command="${1:-}"
+  [[ -z "$_command" ]] && { _help; exit $_E_USG; }
+  shift
+  
+  # Route to appropriate handler
+  case "$_command" in
+    # Package operations
+    add) _cmd_add "$@" ;;
+    install)
+      if [[ -f "${1:-}" ]]; then
+        # Manifest mode: <path> is an existing file, not a tracked package name
+        [[ -n "$_HOST" ]] || { u.error "--host required for manifest mode (install <manifest> --host <h>)"; exit $_E_USG; }
+        _manifest_apply "$1" "$(loam.os)" "$_HOST" install
+        exit $?
+      fi
+      _cmd_install "$@"
+      ;;
+    update) _cmd_update "$@" ;;
+    uninstall) _cmd_uninstall "$@" ;;
+    remove) _cmd_remove "$@" ;;
+    status) _cmd_status "$@" ;;
+    info) _cmd_status "$@" ;;
+    sync)
+      if [[ -f "${1:-}" ]]; then
+        # Manifest mode: <path> is an existing file, not a tracked package name
+        [[ -n "$_HOST" ]] || { u.error "--host required for manifest mode (sync <manifest> --host <h> [--prune])"; exit $_E_USG; }
+        _manifest_sync "$1" "$(loam.os)" "$_HOST" "$_PRUNE"
+        exit $?
+      fi
+      _cmd_sync "$@"
+      ;;
+    # Batch operations
+    install-all) _cmd_install_all "$@" ;;
+    sync-all) _cmd_sync_all "$@" ;;
+    update-all) _cmd_update_all "$@" ;;
+    list-all) _cmd_list_all "$@" ;;
+    list) _cmd_list_all "$@" ;;  # Backward compatibility alias
+    list-packages) _cmd_list_packages "$@" ;;
+    list-scopes) _cmd_list_scopes "$@" ;;
+    # System operations
+    provision) _cmd_provision "$@" ;;
+    provision-all) _cmd_provision "all" "$@" ;;  # Helper alias for provision all
+    # System
+    help) _help; exit 0 ;;
+    version) _version; exit 0 ;;
+    # Hidden test-only command: exposes _tags_match without needing to source pkgman
+    __tags-match) _tags_match "$@"; exit $? ;;
+    *) u.error "unknown command: $_command"; _help; exit $_E_USG ;;
+  esac
+}
+
+##@ Validate that all required pkglib functions exist for supported managers
+##@ Checks that pkglib.{manager}.{operation} functions are available
+##@ Exits with dependency error if any required functions are missing
+_validate_pkglib_consistency() {
+  local _manager _operation _function_name
+  local _missing_functions=()
+  
+  # Check each manager/operation combination
+  for _manager in "${PKGMAN_MANAGERS[@]:-}"; do
+    for _operation in "${PKGMAN_OPERATIONS[@]:-}"; do
+      _function_name="pkglib.${_manager}.${_operation}"
+      if ! declare -f "$_function_name" >/dev/null 2>&1; then
+        _missing_functions+=("$_function_name")
+      fi
+    done
+  done
+  
+  # Report any missing functions
+  if [[ ${#_missing_functions[@]} -gt 0 ]]; then
+    u.error "pkglib consistency check failed - missing functions:"
+    local _func
+    for _func in "${_missing_functions[@]:-}"; do
+      u.error "  $_func"
+    done
+    u.error "ensure pkglib library is properly loaded and up to date"
+    exit $_E_DEP
+  fi
+  
+  u.debug "pkglib consistency check passed - all ${#PKGMAN_MANAGERS[@]} managers with ${#PKGMAN_OPERATIONS[@]} operations validated"
+}
+
+##@ Load pkglib library with path discovery and validation
+##@ Searches multiple locations for the pkglib library and loads it
+##@ Exits with dependency error if library cannot be found or loaded
+_load_pkglib() {
+  # Find and load pkglib library
+  local _pkglib_path=""
+  
+  # Check same-dir first (shed layout: pkgman/pkglib live side by side)
+  if [[ -f "$__APPDIR/pkglib" ]]; then
+    _pkglib_path="$__APPDIR/pkglib"
+  # Check relative to this script's directory (legacy layout)
+  elif [[ -f "$__APPDIR/../lib/pkglib" ]]; then
+    _pkglib_path="$__APPDIR/../lib/pkglib"
+  # Check in SHED_CORE if available
+  elif [[ -n "${SHED_CORE:-}" && -f "$SHED_CORE/lib/pkglib" ]]; then
+    _pkglib_path="$SHED_CORE/lib/pkglib"
+  # Check standard locations
+  elif [[ -f "$HOME/.local/lib/pkglib" ]]; then
+    _pkglib_path="$HOME/.local/lib/pkglib"
+  else
+    u.error "pkglib library not found"
+    u.error "Expected locations: $__APPDIR/pkglib, $__APPDIR/../lib/pkglib, \$SHED_CORE/lib/pkglib, ~/.local/lib/pkglib"
+    exit $_E_DEP
+  fi
+  
+  u.debug "loading pkglib from: $_pkglib_path"
+  source "$_pkglib_path" || { u.error "failed to load pkglib library"; exit $_E_DEP; }
+  
+  # Validate pkglib consistency
+  _validate_pkglib_consistency
+}
+
+##@ State management functions for package configuration files
+##@ Returns path to resolved packages configuration file (merged from scope files)
+_get_packages_file() { 
+  # Ensure index directory exists
+  [[ ! -d "$PKGMAN_INDEX_DIR" ]] && mkdir -p "$PKGMAN_INDEX_DIR"
+  
+  # Create resolved file by merging all scope files
+  # shellcheck disable=SC2188  # intentional: truncate resolved-cfg file, no command needed
+  > "$PKGMAN_RESOLVED_FILE"  # Clear resolved file
+  
+  # Merge all scope files from index directory (if any exist)
+  local _scope_file
+  for _scope_file in "$PKGMAN_INDEX_DIR"/package.*.cfg; do
+    [[ -f "$_scope_file" ]] && cat "$_scope_file" >> "$PKGMAN_RESOLVED_FILE"
+  done
+  
+  echo "$PKGMAN_RESOLVED_FILE"
+}
+##@ Returns path to status configuration file
+_get_status_file() { echo "$PKGMAN_STATUS_FILE"; }
+##@ Returns path to configuration directory
+_get_config_dir() { echo "$PKGMAN_CONFIG_DIR"; }
+
+##@ Dry-run helper functions for safe testing and validation
+##@ Shows dry-run message and returns success to skip actual command execution
+_dry() { [[ "$_DRY_RUN" == "true" ]] && { u.info "[DRY RUN] $*"; return 0; }; return 1; }
+##@ Determines if state updates should be performed based on tracking settings
+_should_update_state() { [[ "$_NO_TRACK" == "false" ]]; return $?; }
+
+##@ Normalize manager aliases and validate manager is supported
+##@ Returns normalized manager name or exits with error
+##@ Usage: _manager=$(_normalize_and_validate_manager "$_manager") || return $?
+_normalize_and_validate_manager() {
+  local _manager="$1"
+  # Normalize aliases
+  case "$_manager" in
+    ghub) _manager="github" ;;
+    dnld) _manager="download" ;;
+  esac
+  # Validate against supported managers array
+  local _m
+  for _m in "${PKGMAN_MANAGERS[@]:-}"; do
+    [[ "$_manager" == "$_m" ]] && { echo "$_manager"; return 0; }
+  done
+  u.error "unsupported manager: $_manager"
+  return $_E_USG
+}
+
+##@ Validate scope name format and characters
+##@ Returns success if scope is valid, error otherwise
+##@ Usage: _validate_scope "$_scope" || return $?
+_validate_scope() {
+  local _scope="$1"
+  [[ -z "$_scope" ]] && { u.error "scope name required"; return $_E_USG; }
+  
+  # Check for alphanumeric only (no spaces, special chars)
+  if [[ ! "$_scope" =~ ^[a-zA-Z0-9]+$ ]]; then
+    u.error "invalid scope name: '$_scope' (alphanumeric only, no spaces)"
+    return $_E_USG
+  fi
+  
+  return 0
+}
+
+##@ Validate OS parameter
+##@ Returns success if OS is valid, error otherwise
+##@ Usage: _validate_os "$_os" || return $?
+_validate_os() {
+  local _os="$1"
+  [[ -z "$_os" ]] && { u.error "OS parameter required"; return $_E_USG; }
+  
+  # Check for valid OS values
+  case "$_os" in
+    default|mac|linux) return 0 ;;
+    *) u.error "invalid OS: '$_os' (valid options: default, mac, linux)"; return $_E_USG ;;
+  esac
+}
+
+##@ Validate sudo parameter
+##@ Returns success if sudo is valid, error otherwise
+##@ Usage: _validate_sudo "$_sudo" || return $?
+_validate_sudo() {
+  local _sudo="$1"
+  [[ -z "$_sudo" ]] && { u.error "sudo parameter required"; return $_E_USG; }
+  
+  # Check for valid sudo values
+  case "$_sudo" in
+    true|false) return 0 ;;
+    *) u.error "invalid sudo value: '$_sudo' (valid options: true, false)"; return $_E_USG ;;
+  esac
+}
+
+##@ Check OS compatibility for package
+##@ Returns success if package can be installed on current OS, warns and returns error if not
+##@ Usage: _validate_os_compatibility "$_package" "$_os" || return $?
+_validate_os_compatibility() {
+  local _package="$1" _os="$2"
+  [[ -z "$_package" ]] && { u.error "package name required"; return $_E_USG; }
+  [[ -z "$_os" ]] && { u.error "OS parameter required"; return $_E_USG; }
+  
+  # If OS is default, compatible with any OS
+  [[ "$_os" == "default" ]] && return 0
+  
+  # Get current OS
+  local _current_os
+  case "$(uname)" in
+    Darwin) _current_os="mac" ;;
+    Linux) _current_os="linux" ;;
+    *) _current_os="unknown" ;;
+  esac
+  
+  # Check compatibility
+  if [[ "$_os" != "$_current_os" ]]; then
+    u.warn "package '$_package' is marked for OS '$_os' but current OS is '$_current_os'"
+    u.error "cannot install incompatible package - use --force to override"
+    return $_E_OS
+  fi
+  
+  return 0
+}
+
+##@ Check whether a package's tags allow it to apply on the given os/host
+##@ Empty tags always match. Tags containing mac|linux require that os to match;
+##@ tags containing laptop|macmini|server require that host to match. Host is
+##@ ALWAYS passed in by the caller (--host) - never derived from the local machine.
+##@ Usage: _tags_match "$_tags" "$_os" "$_host" || continue
+_tags_match() {  # $1=tags $2=os $3=host ; return 0 if row applies
+  local _t=",${1// /}," _os="$2" _host="$3"
+  [[ "$_t" == ",," ]] && return 0
+  case "$_t" in *,mac,*|*,linux,*)
+    case "$_t" in *,"$_os",*) ;; *) return 1;; esac ;; esac
+  case "$_t" in *,laptop,*|*,macmini,*|*,server,*)
+    case "$_t" in *,"$_host",*) ;; *) return 1;; esac ;; esac
+  return 0
+}
+
+##@ Strip leading/trailing whitespace from a string, preserving internal whitespace
+##@ Usage: _trimmed="$(_manifest_trim "$_raw")"
+_manifest_trim() {
+  local _s="${1:-}"
+  _s="${_s#"${_s%%[![:space:]]*}"}"
+  _s="${_s%"${_s##*[![:space:]]}"}"
+  printf '%s' "$_s"
+}
+
+##@ Apply a manifest file: add (if untracked) and install (if missing) every
+##@ row whose tags match the given os/host. Lock-ignorant: params (including
+##@ version=) flow through as ordinary --key=value kwargs, no special handling.
+##@ Row grammar: name|handler|desc|params|tags ; params are k=v pairs joined
+##@ by '!' or ';'. '#'-comments and blank lines are skipped. Unknown handlers
+##@ warn and skip the row rather than aborting the whole manifest.
+##@ Usage: _manifest_apply <file> <os> <host> <mode=install>
+_manifest_apply() {
+  local _file="$1" _os="$2" _host="$3" _mode="${4:-install}"
+  [[ -f "$_file" ]] || { u.error "manifest not found: $_file"; return $_E_NF; }
+  [[ "$_mode" == "install" ]] || { u.error "manifest: unsupported mode '$_mode'"; return $_E_USG; }
+
+  local _name _handler _desc _params _tags
+  local _applied=0 _skipped_tags=0 _skipped_handler=0
+  while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
+    _name="$(_manifest_trim "${_name:-}")"
+    [[ -z "$_name" ]] && continue
+    case "$_name" in \#*) continue ;; esac
+
+    _handler="$(_manifest_trim "${_handler:-}")"
+    _desc="$(_manifest_trim "${_desc:-}")"
+    _params="$(_manifest_trim "${_params:-}")"
+    _tags="$(_manifest_trim "${_tags:-}")"
+
+    if ! _tags_match "$_tags" "$_os" "$_host" </dev/null; then
+      _skipped_tags=$((_skipped_tags + 1))
+      continue
+    fi
+
+    local _normalized_handler
+    _normalized_handler="$(_normalize_and_validate_manager "$_handler" 2>/dev/null </dev/null)" || {
+      u.warn "manifest: unknown handler '$_handler' for $_name - skipping row"
+      _skipped_handler=$((_skipped_handler + 1))
+      continue
+    }
+
+    # params: k=v pairs joined by '!' or ';' -> --k=v kwargs, passed through as-is.
+    # No special handling for any key (including version=) - pkgman stays
+    # lock-ignorant. Relative source= paths resolve the same way `add` already
+    # resolves them (via pkglib's resolve-source-path search, cwd-relative as
+    # a last resort) - see report for why manifest-dir-relative rewriting was
+    # rejected: the fixture's source= is intentionally cwd-relative.
+    local _kv_arr=() _kwargs=() _p _key _val
+    if [[ -n "$_params" ]]; then
+      # here-string already isolates this read's stdin from the manifest fd;
+      # `|| true` guards against set -e since read's status isn't meaningful here
+      IFS='!;' read -r -a _kv_arr <<< "$_params" || true
+    fi
+    for _p in "${_kv_arr[@]+"${_kv_arr[@]}"}"; do
+      [[ -z "$_p" ]] && continue
+      _key="${_p%%=*}"
+      _val="${_p#*=}"
+      _kwargs+=("--${_key}=${_val}")
+    done
+
+    if ! _is_tracked "$_name" </dev/null; then
+      local _add_args=(--detail "${_desc:-$_name}")
+      [[ -n "$_tags" ]] && _add_args+=(--tags "$_tags")
+      _add_args+=("${_kwargs[@]+"${_kwargs[@]}"}")
+      if ! _cmd_add "$_normalized_handler" "$_name" "${_add_args[@]+"${_add_args[@]}"}" </dev/null; then
+        u.warn "manifest: add failed for $_name - skipping row"
+        continue
+      fi
+    fi
+
+    if [[ "$(_get_package_status "$_name" </dev/null)" != "$_PKGMAN_STATUS_INSTALLED" ]]; then
+      _cmd_install "$_name" </dev/null || u.warn "manifest: install failed for $_name"
+    fi
+    _applied=$((_applied + 1))
+  done < "$_file"
+
+  u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler)"
+  return 0
+}
+
+##@ List the names of every manifest row applicable to the given os/host.
+##@ Applies the same '#'-comment/blank-line and _tags_match filters as
+##@ _manifest_apply, but deliberately does NOT skip rows with an unknown
+##@ handler: a row still DECLARES its name (column 1) for prune-protection
+##@ purposes even if its handler is unrecognized (e.g. a typo). A parse
+##@ problem must never escalate into a destructive `sync --prune` removal -
+##@ _manifest_apply already warns+skips the bad-handler row for install
+##@ purposes, so the two functions are intentionally asymmetric here.
+##@ Usage: _declared="$(_manifest_declared_names <file> <os> <host>)"
+_manifest_declared_names() {  # $1=file $2=os $3=host -> applicable names, one per line
+  local _file="$1" _os="$2" _host="$3"
+  local _name _handler _desc _params _tags
+  while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
+    _name="$(_manifest_trim "${_name:-}")"
+    [[ -z "$_name" ]] && continue
+    case "$_name" in \#*) continue ;; esac
+
+    _tags="$(_manifest_trim "${_tags:-}")"
+
+    _tags_match "$_tags" "$_os" "$_host" </dev/null || continue
+
+    echo "$_name"
+  done < "$_file"
+  return 0
+}
+
+##@ Converge tracked state against a manifest: apply installs, then (iff prune)
+##@ remove tracking+installation for every install_method=pkgman package in
+##@ scope core that is no longer declared by the manifest for this os/host.
+##@ NEVER touches install_method=manual packages or non-core scopes - those
+##@ are simply invisible to this function (filtered via _get_packages_by_scope
+##@ + the install_method check below).
+##@ Usage: _manifest_sync <file> <os> <host> <prune:true|false>
+_manifest_sync() {
+  local _file="$1" _os="$2" _host="$3" _prune="${4:-false}"
+  _manifest_apply "$_file" "$_os" "$_host" install || return $?
+
+  local _declared="$(_manifest_declared_names "$_file" "$_os" "$_host")"
+
+  local _core_packages
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _core_packages=($(_get_packages_by_scope "$PKGMAN_SCOPE_CORE" </dev/null))
+
+  local _pkg _undeclared=()
+  for _pkg in "${_core_packages[@]+"${_core_packages[@]}"}"; do
+    [[ -z "$_pkg" ]] && continue
+    grep -Fqx "$_pkg" <<< "$_declared" && continue
+    local _method="$(_get_status "$_pkg" "$_PKGMAN_FIELD_INSTALL_METHOD" </dev/null)"
+    [[ "$_method" == "$_PKGMAN_INSTALL_METHOD_PKGMAN" ]] || continue
+    _undeclared+=("$_pkg")
+  done
+
+  if [[ ${#_undeclared[@]} -eq 0 ]]; then
+    u.info "✓ sync: converged (nothing undeclared)"
+    return 0
+  fi
+
+  u.warn "undeclared pkgman-managed package(s): ${_undeclared[*]}"
+
+  if [[ "$_prune" != "true" ]]; then
+    u.info "run again with --prune to remove them"
+    return 0
+  fi
+
+  _dry "prune: ${_undeclared[*]}" && return 0
+
+  if [[ "$_FORCE" != "true" ]]; then
+    loam.confirm "prune ${#_undeclared[@]} undeclared package(s): ${_undeclared[*]}?" || { u.info "prune cancelled"; return 0; }
+  fi
+
+  local _result=0
+  for _pkg in "${_undeclared[@]}"; do
+    if _cmd_uninstall "$_pkg" </dev/null && _cmd_remove "$_pkg" --force </dev/null; then
+      u.info "✓ pruned $_pkg"
+    else
+      u.error "✗ failed to prune $_pkg"
+      _result=1
+    fi
+  done
+  return $_result
+}
+
+##@ Parse force flag from arguments with unknown option handling
+##@ Usage: _parse_force_flag "$@" -> sets _force variable and skips unknown options
+_parse_force_flag() {
+  _force=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) _force=true; shift ;;
+      *) shift ;;  # Skip unknown options instead of erroring
+    esac
+  done
+  return 0
+}
+
+##@ Build force flags array based on _force variable
+##@ Usage: _flags=($(_build_force_flags)) -> returns --force if _force is true, empty otherwise
+_build_force_flags() {
+  [[ "$_force" == "true" ]] && echo "--force"
+}
+
+##@ Validate that package is tracked, show consistent error if not
+##@ Usage: _validate_package_tracked "$_package" || return $?
+_validate_package_tracked() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || u.die "package name required for validation"
+  
+  if ! _is_tracked "$_package"; then
+    u.error "package not tracked: $_package - $_PKGMAN_ERROR_MSG_ADD_TO_TRACK"
+    return $_E_NF
+  fi
+  return 0
+}
+
+##@ Check if packages file exists, return silently if not (for internal functions)
+##@ Usage: _ensure_packages_file_exists || return $?
+_ensure_packages_file_exists() {
+  local _packages_file="$(_get_packages_file)"
+  [[ -f "$_packages_file" ]] && return 0
+  return 1
+}
+
+##@ Check if packages file exists, show user message if not (for user commands)
+##@ Usage: _ensure_packages_file_exists_user_msg "$message" || return $?
+_ensure_packages_file_exists_user_msg() {
+  local _message="${1:-no packages tracked}"
+  local _packages_file="$(_get_packages_file)"
+  if [[ ! -f "$_packages_file" ]]; then
+    u.info "$_message"
+    return 1
+  fi
+  return 0
+}
+
+##@ Get package status with fallback to unknown
+##@ Usage: _status=$(_get_package_status "$_package") -> returns current status or "unknown" if not found
+_get_package_status() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  
+  local _status
+  _status=$(_get_status "$_package" "$_PKGMAN_FIELD_STATUS" 2>/dev/null) || _status="$_PKGMAN_STATUS_UNKNOWN"
+  echo "$_status"
+}
+
+##@ Escape package name for safe use in regex patterns
+##@ Escapes special regex characters to prevent grep pattern injection
+_escape_package_name() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  printf '%s\n' "$_package" | sed 's/[[]\*^$()+?{|]/\\&/g'
+}
+
+##@ Check if a metadata key is a core metadata field
+##@ Usage: _is_core_metadata_field "manager" -> returns 0 if core metadata, 1 if not
+_is_core_metadata_field() {
+  local _field="${1#*.}"  # Remove package prefix
+  local _core_field
+  for _core_field in "${PKGMAN_CORE_METADATA[@]:-}"; do
+    [[ "$_field" == "$_core_field" ]] && return 0
+  done
+  return 1
+}
+
+##@ Extract package-specific configuration parameters (kwargs) from packages file
+##@ Returns --key=value arguments for pkglib functions via stdout
+##@ Usage: _kwargs=($(_get_package_config "$_package"))
+_get_package_config() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  
+  local _packages_file="$(_get_packages_file)"
+  _ensure_packages_file_exists || return 0
+  
+  local _escaped_package
+  _escaped_package=$(_escape_package_name "$_package") || return $?
+  
+  # Extract all package.key=value entries except core metadata
+  while IFS='=' read -r _key _value; do
+    if _is_core_metadata_field "$_key"; then
+      # Skip core metadata fields
+      continue
+    else
+      # shellcheck disable=SC2295  # legacy archive pattern, pre-loam; \$_package has no glob metacharacters in practice
+      local _kwarg_key="${_key#$_package.}"
+      if [[ "$_kwarg_key" != "$_key" ]]; then
+        printf '%s\n' "--$_kwarg_key=$_value"
+      fi
+    fi
+  done < <(grep "^${_escaped_package}\\." "$_packages_file" 2>/dev/null | cut -d'=' -f1,2-)
+}
+
+##@ Unified package manager dispatcher
+##@ Calls appropriate pkglib function with consistent error handling
+##@ Maps unified metadata to pkglib function parameters
+_call_pkglib() {
+  local _manager="$1" _operation="$2" _package="$3"
+  shift 3
+  local _flags=("$@")
+  
+  # Normalize and validate manager
+  _manager=$(_normalize_and_validate_manager "$_manager") || return $?
+  
+  # All managers use <source> <force> [kwargs...] signature
+  local _force="false"
+  local _i=0
+  local _kwargs=()
+  
+  # Extract force flag from flags array
+  while [[ $_i -lt ${#_flags[@]} ]]; do
+    if [[ "${_flags[$_i]:-}" == "--force" ]]; then
+      _force="true"
+    fi
+    _i=$((_i + 1))
+  done
+  
+  # Build complete kwargs array: core parameters + manager-specific kwargs
+  local _kwargs=()
+  
+  # Add core parameters if not default (required by pkglib interface)
+  local _source _dest _artifact _sudo
+  _source=$(_get_metadata "$_package" "source")
+  _dest=$(_get_metadata "$_package" "dest") 
+  _artifact=$(_get_metadata "$_package" "artifact")
+  _sudo=$(_get_metadata "$_package" "sudo")
+  
+  # Note: _source is passed as first parameter, no need for --source kwarg
+  [[ "$_dest" != "default" && -n "$_dest" ]] && _kwargs+=("--dest=$_dest")
+  [[ "$_artifact" != "default" && -n "$_artifact" ]] && _kwargs+=("--artifact=$_artifact")
+  [[ "$_sudo" == "true" ]] && _kwargs+=("--sudo=true")
+  
+  # Add manager-specific kwargs from metadata
+  while IFS= read -r _kwarg; do
+    [[ -n "$_kwarg" ]] && _kwargs+=("$_kwarg")
+  done < <(_get_package_config "$_package")
+  
+  # Auto-inject pkgman path for script managers to enable dogfooding
+  if [[ "$_manager" == "script" ]]; then
+    _kwargs+=(--pkgman="$(realpath "$__APPFILE")")
+  fi
+  
+  u.debug "_call_pkglib - manager=$_manager, operation=$_operation, package=$_package, source=$_source,  force=$_force, kwargs=${_kwargs[*]:-none}"
+  
+  "pkglib.${_manager}.${_operation}" "$_source" "$_force" "${_kwargs[@]:-}" || return $?
+}
+
+##@ Atomic config file update helper
+##@ Performs safe key-value updates with proper escaping and temp file handling
+_update_config_file() {
+  local _file="$1" _key="$2" _value="$3"
+  _pkglib.require_params "config file path" "$_file" "config key" "$_key" "config value" "$_value" || return $?
+  
+  # Skip state updates if not appropriate
+  _should_update_state || return 0
+  local _config_dir="$(dirname "$_file")"
+  [[ ! -d "$_config_dir" ]] && mkdir -p "$_config_dir"
+  [[ ! -f "$_file" ]] && touch "$_file"
+  
+  local _temp_file="$(mktemp)"
+  
+  # Ensure cleanup on exit/interrupt
+  _cleanup_temp() { [[ -f "$_temp_file" ]] && rm -f "$_temp_file"; }
+  trap _cleanup_temp EXIT INT TERM
+  
+  local _escaped_key
+  _escaped_key=$(_escape_package_name "$_key") || { _cleanup_temp; return $?; }
+  
+  # Remove existing entry and add new one
+  grep -v "^${_escaped_key}=" "$_file" 2>/dev/null > "$_temp_file" || true
+  echo "${_key}=${_value}" >> "$_temp_file"
+  
+  # Atomic update
+  if mv "$_temp_file" "$_file"; then
+    trap - EXIT INT TERM  # Success - disable cleanup trap
+    return 0
+  else
+    u.error "failed to update config file: $_file"
+    _cleanup_temp
+    return $_E
+  fi
+}
+
+##@ Check if package is tracked and get its current status
+##@ Returns: 0=not_tracked, 1=tracked_installed, 2=tracked_not_installed
+_get_package_tracking_state() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  
+  if ! _is_tracked "$_package"; then
+    echo "not_tracked"
+    return 0
+  fi
+  
+  local _current_status
+  _current_status=$(_get_package_status "$_package")
+  
+  if [[ "$_current_status" == "$_PKGMAN_STATUS_INSTALLED" ]]; then
+    echo "tracked_installed"
+    return 1
+  else
+    echo "tracked_not_installed:$_current_status"
+    return 2
+  fi
+}
+
+##@ Handle metadata overwrite for installed packages
+##@ Returns: 0=proceed, 1=cancelled
+_handle_installed_package_overwrite() {
+  local _package="$1"
+  u.warn "package already tracked and installed: $_package"
+  u.warn "changing metadata may cause conflicts with existing installation"
+  if ! loam.confirm "overwrite metadata anyway?"; then
+    u.info "cancelled - to change metadata safely:"
+    u.info "  1) pkgman uninstall $_package && pkgman remove $_package"
+    u.info "  2) pkgman add -m <manager> $_package [new-options]"
+    u.info "  3) pkgman install $_package"
+    return 1
+  fi
+  u.warn "overwriting metadata for installed package: $_package"
+  return 0
+}
+
+##@ Handle metadata overwrite for not-installed packages
+##@ Returns: 0=proceed, 1=cancelled
+_handle_not_installed_package_overwrite() {
+  local _package="$1" _status="$2"
+  u.warn "package already tracked: $_package (status: $_status)"
+  if ! loam.confirm "overwrite existing metadata?"; then
+    u.info "cancelled"
+    return 1
+  fi
+  u.info "overwriting metadata for $_package"
+  return 0
+}
+
+##@ Validate state transition for add command - handles tracking state conflicts
+##@ Returns: 0 = proceed, 1 = cancelled by user
+_validate_add_state_transition() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  
+  local _state
+  _state=$(_get_package_tracking_state "$_package")
+  local _result=$?
+  
+  case "$_result" in
+    0) # not_tracked - safe to proceed
+      return 0
+      ;;
+    1) # tracked_installed - requires confirmation
+      _handle_installed_package_overwrite "$_package"
+      ;;
+    2) # tracked_not_installed - requires confirmation
+      local _status="${_state#tracked_not_installed:}"
+      _handle_not_installed_package_overwrite "$_package" "$_status"
+      ;;
+    *) # unexpected state
+      u.error "unexpected package state: $_state"
+      return $_E
+      ;;
+  esac
+}
+
+##@ Verify package installation and complete tracking setup
+##@ Performs status check, cleanup on failure, and sets tracking metadata
+_verify_and_complete_tracking() {
+  # shellcheck disable=SC2318  # legacy archive pattern, pre-loam
+  local _manager="$1" _package="$2" _manager_display="${3:-$_manager}"
+  _pkglib.require_params "manager" "$_manager" "package name" "$_package" || return $?
+  
+  # Verify package is actually installed
+  local _pkg_status
+  _pkg_status=$(_call_pkglib "$_manager" "status" "$_package") || {
+    u.error "failed to verify $_manager_display package: $_package"
+    # In dry-run mode, preserve state for testing even if verification fails
+    [[ "$_DRY_RUN" != "true" ]] && _remove_package_state "$_package"
+    return $_E
+  }
+  
+  if [[ "$_pkg_status" != "$_PKGMAN_STATUS_INSTALLED" ]]; then
+    u.error "cannot verify $_package: package not installed (status: $_pkg_status)"
+    # In dry-run mode, preserve state for testing even if package not installed  
+    [[ "$_DRY_RUN" != "true" ]] && _remove_package_state "$_package"
+    return $_E_NF
+  fi
+  
+  # Complete tracking setup
+  _set_status "$_package" "$_PKGMAN_FIELD_INSTALL_METHOD" "$_PKGMAN_INSTALL_METHOD_MANUAL"
+  _set_status "$_package" "$_PKGMAN_FIELD_STATUS" "$_PKGMAN_STATUS_INSTALLED"
+  _set_status "$_package" "$_PKGMAN_FIELD_INSTALLED_AT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  
+  u.info "✓ $_package added to $_manager_display tracking"
+}
+
+##@ Store optional metadata if value is provided
+##@ Usage: _set_optional_metadata package key value
+_set_optional_metadata() {
+  local _package="$1" _key="$2" _value="$3"
+  if [[ -n "$_value" ]]; then
+    _set_metadata "$_package" "$_key" "$_value"
+  fi
+  return 0
+}
+##@ Performs atomic cleanup of package metadata and status information
+##@ Uses properly escaped package names for safe grep pattern matching
+_remove_package_state() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  
+  # Skip state updates if not appropriate
+  _should_update_state || return 0
+  
+  # Escape package name for safe regex usage
+  local _escaped_package
+  _escaped_package=$(_escape_package_name "$_package") || return $?
+  
+  # Get the package's scope to determine which file to update
+  local _scope
+  _scope=$(_get_package_scope "$_package" 2>/dev/null) || _scope="core"
+  
+  # Remove from scope-specific file (source of truth)
+  local _scope_file="$PKGMAN_INDEX_DIR/package.${_scope}.cfg"
+  local _status_file="$(_get_status_file)"
+  
+  # Helper function for safe file updates
+  _update_file() {
+    local _file="$1" _pattern="$2"
+    [[ ! -f "$_file" ]] && return 0
+    
+    local _temp_file="$(mktemp)"
+    _cleanup() { [[ -f "$_temp_file" ]] && rm -f "$_temp_file"; }
+    trap _cleanup EXIT INT TERM
+    
+    grep -v "$_pattern" "$_file" > "$_temp_file" || true
+    if mv "$_temp_file" "$_file"; then
+      trap - EXIT INT TERM
+      return 0
+    else
+      u.error "failed to update file: $_file"
+      _cleanup
+      return $_E
+    fi
+  }
+  
+  # Remove from scope-specific file and status file
+  _update_file "$_scope_file" "^${_escaped_package}\\." || return $?
+  _update_file "$_status_file" "^${_escaped_package}\\." || return $?
+}
+
+##@ Retrieve metadata value for a package from packages configuration file
+##@ Returns the value for the specified package.key combination
+##@ Uses escaped package names for safe grep pattern matching  
+_get_metadata() {
+  local _package="$1" _key="$2"
+  _pkglib.require_params "package name" "$_package" "metadata key" "$_key" || return $?
+  
+  local _file="$(_get_packages_file)"
+  [[ ! -f "$_file" ]] && { u.error "packages configuration not found: $_file - no packages have been added yet"; return $_E_NF; }
+  
+  # Escape package name for safe regex usage
+  local _escaped_package
+  _escaped_package=$(_escape_package_name "$_package") || return $?
+  
+  grep "^${_escaped_package}\.${_key}=" "$_file" 2>/dev/null | head -1 | cut -d'=' -f2-
+}
+
+##@ Set metadata value for a package in packages configuration file
+##@ Performs atomic update by replacing existing entries with new values
+##@ Uses escaped package names for safe grep pattern matching
+_set_metadata() {
+  local _package="$1" _key="$2" _value="$3"
+  _pkglib.require_params "package name" "$_package" "metadata key" "$_key" "metadata value" "$_value" || return $?
+  
+  # Determine target scope file based on package's scope
+  local _scope="core"  # default scope
+  if [[ "$_key" == "scope" ]]; then
+    _scope="$_value"
+  else
+    # Get existing scope for this package, default to core
+    _scope=$(_get_package_scope "$_package" 2>/dev/null) || _scope="core"
+  fi
+  
+  # Ensure index directory exists
+  [[ ! -d "$PKGMAN_INDEX_DIR" ]] && mkdir -p "$PKGMAN_INDEX_DIR"
+  
+  # Target scope-specific file in index directory
+  local _file="$PKGMAN_INDEX_DIR/package.${_scope}.cfg"
+  local _config_dir="$(dirname "$_file")"
+  
+  # Validate config directory is accessible if it exists
+  [[ -d "$_config_dir" && ! -w "$_config_dir" ]] && { u.error "config directory not writable: $_config_dir"; return $_E_NP; }
+  
+  local _full_key="${_package}.${_key}"
+  _update_config_file "$_file" "$_full_key" "$_value"
+}
+
+##@ Retrieve status value for a package from status configuration file
+##@ Returns the value for the specified package.key combination
+##@ Uses escaped package names for safe grep pattern matching
+_get_status() {
+  local _package="$1" _key="$2"
+  _pkglib.require_params "package name" "$_package" "status key" "$_key" || return $?
+  
+  local _file="$(_get_status_file)"
+  [[ ! -f "$_file" ]] && return $_E_NF
+  
+  # Escape package name for safe regex usage
+  local _escaped_package
+  _escaped_package=$(_escape_package_name "$_package") || return $?
+  
+  grep "^${_escaped_package}\.${_key}=" "$_file" 2>/dev/null | head -1 | cut -d'=' -f2-
+}
+
+##@ Set status value for a package in status configuration file
+##@ Performs atomic update by replacing existing entries with new values
+##@ Uses escaped package names for safe grep pattern matching
+_set_status() {
+  local _package="$1" _key="$2" _value="$3"
+  _pkglib.require_params "package name" "$_package" "status key" "$_key" "status value" "$_value" || return $?
+  
+  local _file="$(_get_status_file)"
+  local _full_key="${_package}.${_key}"
+  _update_config_file "$_file" "$_full_key" "$_value"
+}
+
+##@ Check if a package is currently being tracked in the packages file
+##@ Returns success (0) if package exists, failure (1) if not found
+##@ Uses escaped package names for safe grep pattern matching
+_is_tracked() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  
+  local _file="$(_get_packages_file)"
+  [[ ! -f "$_file" ]] && return 1
+  
+  # Escape package name for safe regex usage
+  local _escaped_package
+  _escaped_package=$(_escape_package_name "$_package") || return $?
+  
+  grep -q "^${_escaped_package}\." "$_file" 2>/dev/null
+}
+
+
+##@ Extract unique package names from packages configuration file
+##@ Returns array of sorted, unique package names via stdout (one per line)
+##@ Usage: _packages=($(_get_tracked_packages))
+_get_tracked_packages() {
+  local _packages_file="$(_get_packages_file)"
+  _ensure_packages_file_exists || return 0
+  
+  # Get unique package names by parsing package.key=value format
+  local _package _packages=()
+  while IFS='=' read -r _key _value; do
+    [[ -z "$_key" || "$_key" != *.* ]] && continue
+    _package="${_key%%.*}"  # Extract package name before first dot
+    [[ -n "$_package" ]] && _packages+=("$_package")
+  done < "$_packages_file"
+  
+  # Sort and deduplicate packages, output one per line
+  printf '%s\n' "${_packages[@]:-}" | sort -u
+}
+
+##@ Get scope for a specific package
+##@ Returns the scope of the package or "unknown" if not found
+##@ Usage: _scope=$(_get_package_scope "$_package")
+_get_package_scope() {
+  local _package="$1"
+  _pkglib.require_params "package name" "$_package" || return $?
+  
+  local _scope
+  _scope=$(_get_metadata "$_package" "scope" 2>/dev/null) || _scope="unknown"
+  echo "$_scope"
+  return 0
+}
+
+##@ Get packages filtered by scope(s)
+##@ Returns array of package names matching the given scopes
+##@ Usage: _packages=($(_get_packages_by_scope "core" "system"))
+_get_packages_by_scope() {
+  local _target_scopes=("$@")
+  [[ ${#_target_scopes[@]} -eq 0 ]] && { u.error "at least one scope required"; return $_E_USG; }
+  
+  local _all_packages _package _package_scope
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _all_packages=($(_get_tracked_packages))
+  
+  for _package in "${_all_packages[@]:-}"; do
+    [[ -z "$_package" ]] && continue
+    _package_scope=$(_get_package_scope "$_package")
+    
+    # Check if package scope matches any target scope
+    local _scope
+    for _scope in "${_target_scopes[@]:-}"; do
+      if [[ "$_package_scope" == "$_scope" ]]; then
+        echo "$_package"
+        break
+      fi
+    done
+  done
+  return 0
+}
+
+##@ Get effective scopes for batch operations (core + custom default + optionally system/manager)
+##@ Returns array of scopes to be used in batch operations
+##@ Usage: _scopes=($(_get_effective_batch_scopes [include_system_manager]))
+_get_effective_batch_scopes() {
+  local _include_system_manager="${1:-false}"
+  
+  # Always include core scope
+  local _scopes=("$PKGMAN_SCOPE_CORE")
+  
+  # Add custom default scope if different from core
+  if [[ "$PKGMAN_DEFAULT_SCOPE" != "$PKGMAN_SCOPE_CORE" ]]; then
+    _scopes+=("$PKGMAN_DEFAULT_SCOPE")
+  fi
+  
+  # Add system and manager scopes if requested (for sync operations)
+  if [[ "$_include_system_manager" == "true" ]]; then
+    _scopes+=("$PKGMAN_SCOPE_SYSTEM")
+    _scopes+=("$PKGMAN_SCOPE_MANAGER")
+  fi
+  
+  printf '%s\n' "${_scopes[@]}"
+  return 0
+}
+
+##@ Command implementations with comprehensive error handling and state management
+
+##[ operations-package
+##@ Install a tracked package using stored metadata
+##@ Package must already be added to tracking
+_cmd_install() {
+  local _package="${1:-}"
+  _pkglib.require_params "package name" "$_package" || u.die "package name required for install command"
+  shift
+  
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  # Require package to be already tracked
+  _validate_package_tracked "$_package" || exit $_E
+  
+  # Install using stored metadata
+  u.info "installing $_package"
+  _cmd_install_tracked "$_package" "$_force"
+}
+
+##@ Install tracked package using stored metadata
+_cmd_install_tracked() {
+  local _package="$1" _force="$2"
+  
+  # Get stored manager
+  local _stored_manager
+  _stored_manager=$(_get_metadata "$_package" "manager") || { u.error "no manager recorded for $_package"; return $_E_NF; }
+  
+  # Check current status
+  local _current_status
+  _current_status=$(_get_package_status "$_package")
+  
+  if [[ "$_current_status" == "$_PKGMAN_STATUS_INSTALLED" && "$_force" != "true" ]]; then
+    u.info "already installed: $_package"
+    return 0
+  fi
+  
+  u.info "installing $_package using $_stored_manager"
+  
+  # Build force flags
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  local _flags=($(_build_force_flags))
+  
+  # Call appropriate pkglib function using stored metadata
+  local _result=0
+  if ! _dry "pkglib.$_stored_manager.install $_package"; then
+    _call_pkglib "$_stored_manager" "install" "$_package" "${_flags[@]:-}" || _result=$?
+  fi
+  
+  # Update status if installation succeeded
+  if [[ $_result -eq 0 ]]; then
+    _set_status "$_package" "$_PKGMAN_FIELD_INSTALL_METHOD" "$_PKGMAN_INSTALL_METHOD_PKGMAN"
+    _set_status "$_package" "$_PKGMAN_FIELD_STATUS" "$_PKGMAN_STATUS_INSTALLED"
+    _set_status "$_package" "$_PKGMAN_FIELD_INSTALLED_AT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    u.info "✓ $_package installed and tracked"
+  else
+    u.error "✗ failed to install $_package"
+    return $_result
+  fi
+}
+
+##@ Update a tracked package using its recorded package manager
+##@ Updates last_checked timestamp on successful completion
+_cmd_update() {
+  local _package="${1:-}"
+  _pkglib.require_params "package name" "$_package" || u.die "package name required for update command"
+  shift
+  
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  _validate_package_tracked "$_package" || exit $_E
+  
+  local _manager="$(_get_metadata "$_package" "manager")"
+  [[ -z "$_manager" ]] && { u.error "no manager recorded for $_package"; return $_E_NF; }
+  
+  # Check installation status first for unknown/missing packages
+  local _current_status
+  _current_status=$(_get_package_status "$_package")
+  if [[ "$_current_status" == "$_PKGMAN_STATUS_UNKNOWN" || "$_current_status" == "$_PKGMAN_STATUS_MISSING" ]]; then
+    u.info "verifying $_package installation status before update"
+    
+    local _verified_status
+    if ! _dry "pkglib.$_manager.status $_package"; then
+      _verified_status=$(_call_pkglib "$_manager" "status" "$_package") || _verified_status="$_PKGMAN_STATUS_MISSING"
+    else
+      # In dry-run mode, assume it's installed to allow testing update flow
+      _verified_status="$_PKGMAN_STATUS_INSTALLED"
+    fi
+    
+    if [[ "$_verified_status" != "$_PKGMAN_STATUS_INSTALLED" ]]; then
+      u.error "cannot update $_package: not installed (status: $_verified_status)"
+      u.info "use 'pkgman install $_package' to install first"
+      return $_E_NF
+    fi
+    
+    # Update the status since we verified it's installed
+    _set_status "$_package" "$_PKGMAN_FIELD_STATUS" "$_PKGMAN_STATUS_INSTALLED"
+  fi
+  
+  u.info "updating $_package using $_manager"
+  
+  # Build force flags
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  local _flags=($(_build_force_flags))
+  
+  # Call appropriate pkglib function
+  local _result=0
+  if ! _dry "pkglib.$_manager.update $_package"; then
+    _call_pkglib "$_manager" "update" "$_package" "${_flags[@]:-}" || _result=$?
+  fi
+  
+  # Update status if successful
+  if [[ $_result -eq 0 ]]; then
+    _set_status "$_package" "$_PKGMAN_FIELD_LAST_CHECKED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    u.info "✓ $_package updated"
+  else
+    u.error "✗ failed to update $_package"
+    return $_result
+  fi
+}
+
+##@ Uninstall a tracked package but keep tracking metadata
+##@ Removes package using recorded manager but preserves state for reinstall
+_cmd_uninstall() {
+  local _package="${1:-}"
+  _pkglib.require_params "package name" "$_package" || u.die "package name required for uninstall command"
+  shift
+  
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  _validate_package_tracked "$_package" || exit $_E
+  
+  local _manager="$(_get_metadata "$_package" "manager")"
+  [[ -z "$_manager" ]] && { u.error "no manager recorded for $_package"; return $_E_NF; }
+  
+  # Check current status
+  local _current_status
+  _current_status=$(_get_package_status "$_package")
+  
+  if [[ "$_current_status" != "$_PKGMAN_STATUS_INSTALLED" && "$_force" != "true" ]]; then
+    u.info "package not installed: $_package (status: $_current_status)"
+    return 0
+  fi
+  
+  u.info "uninstalling $_package using $_manager"
+  
+  # Build force flags
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  local _flags=($(_build_force_flags))
+  
+  # Call appropriate pkglib function
+  local _result=0
+  if ! _dry "pkglib.$_manager.uninstall $_package"; then
+    _call_pkglib "$_manager" "uninstall" "$_package" "${_flags[@]:-}" || _result=$?
+  fi
+  
+  # Update status but keep tracking metadata
+  if [[ $_result -eq 0 ]]; then
+    _set_status "$_package" "$_PKGMAN_FIELD_STATUS" "$_PKGMAN_STATUS_MISSING"
+    _set_status "$_package" "uninstalled_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    u.info "✓ $_package uninstalled (tracking preserved)"
+  else
+    u.error "✗ failed to uninstall $_package"
+    return $_result
+  fi
+}
+
+##@ Remove tracking metadata for a package (with confirmation if still installed)
+##@ Only removes state files, does not uninstall the actual package
+_cmd_remove() {
+  local _package="${1:-}"
+  _pkglib.require_params "package name" "$_package" || u.die "package name required for remove command"
+  shift
+  
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  _validate_package_tracked "$_package" || exit $_E
+  
+  local _manager="$(_get_metadata "$_package" "manager")"
+  [[ -z "$_manager" ]] && { u.error "no manager recorded for $_package"; return $_E_NF; }
+  
+  # Check if package is still installed
+  local _pkg_status
+  _pkg_status=$(_call_pkglib "$_manager" "status" "$_package" 2>/dev/null) || _pkg_status="$_PKGMAN_STATUS_MISSING"
+  
+  if [[ "$_pkg_status" == "$_PKGMAN_STATUS_INSTALLED" && "$_force" != "true" ]]; then
+    u.warn "package is still installed: $_package"
+    if ! loam.confirm "remove tracking without uninstalling?"; then
+      u.info "cancelled - use 'pkgman uninstall $_package' first or use --force flag"
+      return 0
+    fi
+  fi
+  
+  u.info "removing tracking for $_package"
+  
+  # Remove tracking state only
+  _remove_package_state "$_package"
+  u.info "✓ $_package tracking removed"
+}
+
+##@ Display comprehensive status information for a tracked package
+##@ Shows manager, install method, status, and timestamps with fallbacks
+_cmd_status() {
+  local _package="${1:-}"
+  _pkglib.require_params "package name" "$_package" || u.die "package name required for status command"
+  
+  _validate_package_tracked "$_package" || exit $_E
+  
+  # Get core metadata
+  local _manager="$(_get_metadata "$_package" "manager")"
+  local _source="$(_get_metadata "$_package" "source")"
+  local _dest="$(_get_metadata "$_package" "dest")"
+  local _artifact="$(_get_metadata "$_package" "artifact")"
+  local _channel="$(_get_metadata "$_package" "channel")"
+  local _scope="$(_get_package_scope "$_package")"
+  local _os="$(_get_metadata "$_package" "os")"
+  local _sudo="$(_get_metadata "$_package" "sudo")"
+  local _detail="$(_get_metadata "$_package" "detail")"
+  
+  # Get status data
+  local _install_method="$(_get_status "$_package" "$_PKGMAN_FIELD_INSTALL_METHOD")"
+  local _status="$(_get_status "$_package" "$_PKGMAN_FIELD_STATUS")"
+  local _installed_at="$(_get_status "$_package" "$_PKGMAN_FIELD_INSTALLED_AT")"
+  local _last_checked="$(_get_status "$_package" "$_PKGMAN_FIELD_LAST_CHECKED")"
+  
+  u.info "Package: $_package"
+  u.info "  Description: ${_detail:-$_package}"
+  u.info "  Manager: ${_manager:-$_PKGMAN_STATUS_UNKNOWN}"
+  u.info "  Scope: ${_scope:-unknown}"
+  u.info "  OS: ${_os:-default}"
+  u.info "  Requires Sudo: ${_sudo:-false}"
+  u.info "  Source: ${_source:-$_PKGMAN_STATUS_UNKNOWN}"
+  u.info "  Channel: ${_channel:-default}"
+  u.info "  Destination: ${_dest:-$_PKGMAN_STATUS_UNKNOWN}"
+  u.info "  Artifact: ${_artifact:-$_PKGMAN_STATUS_UNKNOWN}"
+  u.info "  Install Method: ${_install_method:-$_PKGMAN_STATUS_UNKNOWN}"
+  u.info "  Status: ${_status:-$_PKGMAN_STATUS_UNKNOWN}"
+  u.info "  Installed At: ${_installed_at:-$_PKGMAN_STATUS_UNKNOWN}"
+  u.info "  Last Checked: ${_last_checked:-never}"
+  
+  # Show manager-specific configuration
+  local _kwargs=()
+  while IFS= read -r _kwarg; do
+    [[ -n "$_kwarg" ]] && _kwargs+=("$_kwarg")
+  done < <(_get_package_config "$_package")
+  
+  if [[ ${#_kwargs[@]} -gt 0 ]]; then
+    u.info "  Configuration:"
+    local _kwarg
+    for _kwarg in "${_kwargs[@]:-}"; do
+      u.info "    $_kwarg"
+    done
+  fi
+  
+  return 0
+}
+
+##@ Add an existing package to tracking without installing
+##@ Uses unified parameter interface: <manager> <package> [--source] [--dest] [--artifact] [--key=value...]
+_cmd_add() {
+  local _manager="${1:-}" _package="${2:-}"
+  _pkglib.require_params "manager" "$_manager" "package name" "$_package" || u.die "invalid parameters for add command: manager='$_manager' package='$_package'"
+  shift 2
+  
+  # Initialize unified parameters with defaults
+  local _source="default" _dest="default" _artifact="default" _scope="$PKGMAN_DEFAULT_SCOPE"
+  local _os="default" _sudo="false" _detail="" _channel="default"
+  local _param_install="" _param_update="" _param_uninstall="" _param_sync=""
+  local _kwargs_keys=() _kwargs_values=()
+  
+  # Parse optional parameters
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source=*)
+        _source="${1#*=}"; shift ;;
+      --source)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--source requires a value"; return $_E_USG; }
+        _source="$2"; shift 2 ;;
+      --dest=*)
+        _dest="${1#*=}"; shift ;;
+      --dest)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--dest requires a value"; return $_E_USG; }
+        _dest="$2"; shift 2 ;;
+      --artifact=*)
+        _artifact="${1#*=}"; shift ;;
+      --artifact)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--artifact requires a value"; return $_E_USG; }
+        _artifact="$2"; shift 2 ;;
+      --scope=*)
+        _scope="${1#*=}"; shift ;;
+      --scope)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--scope requires a value"; return $_E_USG; }
+        _scope="$2"; shift 2 ;;
+      --os=*)
+        _os="${1#*=}"; shift ;;
+      --os)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--os requires a value"; return $_E_USG; }
+        _os="$2"; shift 2 ;;
+      --sudo=*)
+        _sudo="${1#*=}"; shift ;;
+      --sudo)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--sudo requires a value"; return $_E_USG; }
+        _sudo="$2"; shift 2 ;;
+      --detail=*)
+        _detail="${1#*=}"; shift ;;
+      --detail)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--detail requires a value"; return $_E_USG; }
+        _detail="$2"; shift 2 ;;
+      --channel=*)
+        _channel="${1#*=}"; shift ;;
+      --channel)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--channel requires a value"; return $_E_USG; }
+        _channel="$2"; shift 2 ;;
+      --param.install=*)
+        _param_install="${1#*=}"; shift ;;
+      --param.install)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--param.install requires a value"; return $_E_USG; }
+        _param_install="$2"; shift 2 ;;
+      --param.update=*)
+        _param_update="${1#*=}"; shift ;;
+      --param.update)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--param.update requires a value"; return $_E_USG; }
+        _param_update="$2"; shift 2 ;;
+      --param.uninstall=*)
+        _param_uninstall="${1#*=}"; shift ;;
+      --param.uninstall)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--param.uninstall requires a value"; return $_E_USG; }
+        _param_uninstall="$2"; shift 2 ;;
+      --param.sync=*)
+        _param_sync="${1#*=}"; shift ;;
+      --param.sync)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--param.sync requires a value"; return $_E_USG; }
+        _param_sync="$2"; shift 2 ;;
+      --selector=*)
+        _kwargs_keys+=("selector")
+        _kwargs_values+=("${1#*=}"); shift ;;
+      --selector)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--selector requires a value"; return $_E_USG; }
+        _kwargs_keys+=("selector")
+        _kwargs_values+=("$2"); shift 2 ;;
+      --*=*)
+        local _full="$1"
+        local _key="${_full#--}"
+        _key="${_key%%=*}"
+        local _value="${_full#*=}"
+        [[ -n "$_key" && -n "$_value" ]] || { u.error "invalid parameter format: $_full"; return $_E_USG; }
+        _kwargs_keys+=("$_key")
+        _kwargs_values+=("$_value")
+        shift ;;
+      --*)
+        # Handle any other --key value pair as kwargs
+        local _key="${1#--}"
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "$1 requires a value"; return $_E_USG; }
+        _kwargs_keys+=("$_key")
+        _kwargs_values+=("$2")
+        shift 2 ;;
+      *)
+        u.error "unexpected argument: $1"; return $_E_USG ;;
+    esac
+  done
+  
+  # Normalize and validate manager
+  _manager=$(_normalize_and_validate_manager "$_manager") || return $?
+  
+  # Validate scope
+  _validate_scope "$_scope" || return $?
+  
+  # Validate OS parameter
+  _validate_os "$_os" || return $?
+  
+  # Validate sudo parameter  
+  _validate_sudo "$_sudo" || return $?
+  
+  # Set default detail to package name if not provided
+  [[ -z "$_detail" ]] && _detail="$_package"
+  
+  # Check OS compatibility (can be overridden with --force later)
+  _validate_os_compatibility "$_package" "$_os" || return $?
+  
+  # Universal validation for all managers (includes package existence check)
+  _validate_add_state_transition "$_package" || {
+    local _result=$?
+    [[ $_result -eq 1 ]] && return 0  # User cancelled
+    return $_E  # Other error
+  }
+  
+  # Route to managers with unified signature (8 core params + 4 param.* params = 12 total),
+  # followed by any --key=value kwargs forwarded as N keys then N values so
+  # _cmd_add_unified can re-split them (bash 3.2: no namerefs/assoc arrays).
+  u.debug "add_unified - manager=$_manager, package=$_package, source=$_source, dest=$_dest, artifact=$_artifact, channel=$_channel, os=$_os, sudo=$_sudo, param.install=$_param_install, param.update=$_param_update, param.uninstall=$_param_uninstall, param.sync=$_param_sync"
+  _cmd_add_unified "$_manager" "$_package" "$_source" "$_dest" "$_artifact" "$_channel" "$_os" "$_sudo" "$_param_install" "$_param_update" "$_param_uninstall" "$_param_sync" "${_kwargs_keys[@]+"${_kwargs_keys[@]}"}" "${_kwargs_values[@]+"${_kwargs_values[@]}"}"
+}
+
+##@ Unified add handler for all managers with consistent parameter interface
+##@ Parameters (12 fixed): manager package source dest artifact channel os sudo
+##@   param.install param.update param.uninstall param.sync, followed by any
+##@   forwarded --key=value kwargs as [kwargs_keys...] [kwargs_values...]
+_cmd_add_unified() {
+  # Validate parameter count: 12 fixed params, plus an even number of trailing
+  # kwargs (N keys followed by N values, forwarded by _cmd_add)
+  [[ $# -ge 12 ]] || { u.error "_cmd_add_unified expects at least 12 parameters, got $#"; return $_E; }
+  local _kwargs_argc=$(( $# - 12 ))
+  [[ $(( _kwargs_argc % 2 )) -eq 0 ]] || { u.error "_cmd_add_unified expects matching kwargs keys/values counts, got $_kwargs_argc trailing args"; return $_E; }
+
+  local _manager="$1" _package="$2" _source="$3" _dest="$4" _artifact="$5" _channel="$6" _os="$7" _sudo="$8" _param_install="$9" _param_update="${10}" _param_uninstall="${11}" _param_sync="${12}"
+  shift 12
+
+  # Split the forwarded kwargs (everything past the 12 fixed params) into keys
+  # and values arrays (bash 3.2 compatible)
+  local _half=$(( $# / 2 ))
+  local _kwargs_keys=() _kwargs_values=() _i=0
+  
+  # Extract keys (first half)
+  while [[ $_i -lt $_half ]]; do
+    _kwargs_keys+=("$1")
+    shift
+    _i=$((_i + 1))
+  done
+  
+  # Extract values (second half)
+  _i=0
+  while [[ $_i -lt $_half ]]; do
+    _kwargs_values+=("$1")
+    shift
+    _i=$((_i + 1))
+  done
+  
+  # For traditional managers, default source to package name
+  if [[ "$_source" == "default" ]]; then
+    case "$_manager" in
+      brew|apt|dnf|mas|cargo|go|pipx|npm)
+        _source="$_package"
+        ;;
+      # github/download/script require explicit --source
+    esac
+  fi
+  
+  # Manager-specific validation - build kwargs array for managers that need them
+  local _validation_kwargs=()
+  # Note: _source is passed as first parameter, no need for --source kwarg
+  [[ "$_dest" != "default" ]] && _validation_kwargs+=("--dest=$_dest") 
+  [[ "$_artifact" != "default" ]] && _validation_kwargs+=("--artifact=$_artifact")
+  [[ "$_channel" != "default" ]] && _validation_kwargs+=("--channel=$_channel")
+  
+  # Add any additional kwargs
+  local _i=0
+  while [[ $_i -lt ${#_kwargs_keys[@]} ]]; do
+    local _key="${_kwargs_keys[$_i]:-}"
+    local _value="${_kwargs_values[$_i]:-}"
+    if [[ -n "$_key" && -n "$_value" ]]; then
+      _validation_kwargs+=("--$_key=$_value")
+    fi
+    _i=$((_i + 1))
+  done
+
+  # Always pass source as first parameter - pkglib needs the actual package identifier
+  # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+  u.debug "pkglib.${_manager}.validate - source=$_source, force=false, validation_kwargs=${_validation_kwargs[@]:-}"
+  pkglib.${_manager}.validate "$_source" "false" "${_validation_kwargs[@]:-}" || u.die "validation failed for $_manager package '$_package' with source '$_source'"
+
+  # Store unified metadata (core parameters only) - SET SCOPE FIRST
+  _set_metadata "$_package" "scope" "$_scope"
+  _set_metadata "$_package" "manager" "$_manager"
+  _set_metadata "$_package" "source" "$_source"
+  _set_metadata "$_package" "dest" "$_dest"
+  _set_metadata "$_package" "artifact" "$_artifact"
+  _set_metadata "$_package" "channel" "$_channel"
+  _set_metadata "$_package" "os" "$_os"
+  _set_metadata "$_package" "sudo" "$_sudo"
+  _set_metadata "$_package" "detail" "$_detail"
+  
+  # Store manager-specific kwargs
+  local _i=0
+  while [[ $_i -lt ${#_kwargs_keys[@]} ]]; do
+    local _key="${_kwargs_keys[$_i]:-}"
+    local _value="${_kwargs_values[$_i]:-}"
+    if [[ -n "$_key" && -n "$_value" ]]; then
+      _set_metadata "$_package" "$_key" "$_value"
+    fi
+    _i=$((_i + 1))
+  done
+  
+  u.info "✓ $_package added to tracking"
+  return 0
+}
+
+##@ Synchronize tracked package status with actual installation state
+##@ Checks actual installation status and updates tracking state accordingly
+_cmd_sync() {
+  local _package="${1:-}"
+  _pkglib.require_params "package name" "$_package" || u.die "package name required for sync command"
+  shift
+  
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  _validate_package_tracked "$_package" || exit $_E
+  
+  local _manager="$(_get_metadata "$_package" "manager")"
+  [[ -z "$_manager" ]] && { u.error "no manager recorded for $_package"; return $_E_NF; }
+  
+  # Get current tracked status
+  local _tracked_status
+  _tracked_status=$(_get_package_status "$_package")
+  
+  u.info "synchronizing $_package status using $_manager"
+  
+  # Check actual installation status
+  local _actual_status
+  if ! _dry "pkglib.$_manager.status $_package"; then
+    _actual_status=$(_call_pkglib "$_manager" "status" "$_package" 2>/dev/null) || _actual_status="$_PKGMAN_STATUS_MISSING"
+  else
+    # In dry-run mode, just report what would be checked
+    u.info "[DRY RUN] would check $_manager installation status for $_package"
+    return 0
+  fi
+  
+  if [[ "$_tracked_status" != "$_actual_status" || "$_force" == "true" ]]; then
+    if [[ "$_tracked_status" != "$_actual_status" ]]; then
+      u.info "status mismatch: $_package (tracked: $_tracked_status, actual: $_actual_status)"
+    else
+      u.info "force sync requested for $_package"
+    fi
+    
+    # Update status to match reality
+    _set_status "$_package" "$_PKGMAN_FIELD_STATUS" "$_actual_status"
+    _set_status "$_package" "$_PKGMAN_FIELD_LAST_CHECKED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    
+    # Update install method if package is actually installed but wasn't tracked as such
+    if [[ "$_actual_status" == "$_PKGMAN_STATUS_INSTALLED" && "$_tracked_status" != "$_PKGMAN_STATUS_INSTALLED" ]]; then
+      _set_status "$_package" "$_PKGMAN_FIELD_INSTALL_METHOD" "$_PKGMAN_INSTALL_METHOD_MANUAL"
+      u.info "✓ updated $_package: $_tracked_status → $_actual_status (marked as manual install)"
+    else
+      u.info "✓ updated $_package: $_tracked_status → $_actual_status"
+    fi
+  else
+    # Status matches - just update last_checked timestamp
+    _set_status "$_package" "$_PKGMAN_FIELD_LAST_CHECKED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    u.info "✓ status confirmed: $_package ($_actual_status)"
+  fi
+}
+##] operations-package
+
+##[ operations-batch
+
+##@ List all tracked packages with manager and status information
+##@ Displays formatted table of package information with consistent spacing
+_cmd_list_all() {
+  local _packages_file="$(_get_packages_file)"
+  _ensure_packages_file_exists_user_msg "no packages tracked" || return 0
+  
+  u.info "Tracked packages:"
+  
+  # Get unique package names using helper function
+  local _unique_packages
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _unique_packages=($(_get_tracked_packages))
+  
+  # Display each package with metadata
+  local _package
+  for _package in "${_unique_packages[@]:-}"; do
+    [[ -z "$_package" ]] && continue
+    local _manager="$(_get_metadata "$_package" "manager")"
+    local _status="$(_get_status "$_package" "$_PKGMAN_FIELD_STATUS")"
+    local _scope="$(_get_package_scope "$_package")"
+    local _detail="$(_get_metadata "$_package" "detail")"
+    printf "  %-20s %-8s %-8s %-12s %s\n" "$_package" "${_manager:-$_PKGMAN_STATUS_UNKNOWN}" "${_scope:-unknown}" "${_status:-$_PKGMAN_STATUS_UNKNOWN}" "${_detail:-$_package}"
+  done
+  return 0
+}
+
+##@ List package names only for scripting
+##@ Returns one package name per line with no formatting or headers
+_cmd_list_packages() {
+  # Use helper function to get package names
+  _get_tracked_packages
+  return 0
+}
+
+##@ List all scopes used by tracked packages
+##@ Returns one scope name per line, sorted and unique
+_cmd_list_scopes() {
+  local _packages_file="$(_get_packages_file)"
+  _ensure_packages_file_exists_user_msg "no packages tracked" || return 0
+  
+  local _unique_packages _package _scope _scopes=()
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _unique_packages=($(_get_tracked_packages))
+  
+  # Collect all scopes from tracked packages
+  for _package in "${_unique_packages[@]:-}"; do
+    [[ -z "$_package" ]] && continue
+    _scope=$(_get_package_scope "$_package")
+    [[ -n "$_scope" && "$_scope" != "unknown" ]] && _scopes+=("$_scope")
+  done
+  
+  # Sort and deduplicate scopes, output one per line
+  printf '%s\n' "${_scopes[@]:-}" | sort -u
+  return 0
+}
+
+
+##@ Install all tracked packages that are missing
+##@ Only installs packages with status != installed, skips already installed packages
+_cmd_install_all() {
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  # Get effective scopes for batch operations (excludes system scope)
+  local _effective_scopes
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _effective_scopes=($(_get_effective_batch_scopes))
+  
+  # Get packages filtered by effective scopes
+  local _packages
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _packages=($(_get_packages_by_scope "${_effective_scopes[@]}"))
+  [[ ${#_packages[@]} -eq 0 ]] && { u.info "no packages in scope: ${_effective_scopes[*]}"; return 0; }
+  
+  u.info "installing all missing packages (${#_packages[@]} in scopes: ${_effective_scopes[*]})"
+  
+  local _installed=0 _skipped=0 _failed=0 _package
+  for _package in "${_packages[@]:-}"; do
+    [[ -z "$_package" ]] && continue
+    
+    # Check current status
+    local _current_status
+    _current_status=$(_get_package_status "$_package")
+    
+    if [[ "$_current_status" == "$_PKGMAN_STATUS_INSTALLED" && "$_force" != "true" ]]; then
+      u.info "skipping $_package (already installed)"
+      _skipped=$((_skipped + 1))
+      continue
+    fi
+    
+    u.info "installing $_package"
+    # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+    local _flags=($(_build_force_flags))
+    
+    if _cmd_install "$_package" "${_flags[@]:-}"; then
+      _installed=$((_installed + 1))
+    else
+      u.error "✗ failed to install $_package"
+      _failed=$((_failed + 1))
+    fi
+  done
+  
+  u.info "✓ install-all complete: $_installed installed, $_skipped skipped, $_failed failed"
+  [[ $_failed -gt 0 ]] && return $_E
+  return 0
+}
+
+##@ Sync status for all tracked packages with actual installation state  
+##@ Checks actual installation status and updates tracking state accordingly
+_cmd_sync_all() {
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  # Get effective scopes for batch operations (includes system scope for sync)
+  local _effective_scopes
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _effective_scopes=($(_get_effective_batch_scopes true))
+  
+  # Get packages filtered by effective scopes
+  local _packages
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _packages=($(_get_packages_by_scope "${_effective_scopes[@]}"))
+  [[ ${#_packages[@]} -eq 0 ]] && { u.info "no packages in scope: ${_effective_scopes[*]}"; return 0; }
+  
+  u.info "syncing all package status (${#_packages[@]} in scopes: ${_effective_scopes[*]})"
+  
+  local _synced=0 _failed=0 _package
+  for _package in "${_packages[@]:-}"; do
+    [[ -z "$_package" ]] && continue
+    
+    u.info "syncing $_package"
+    # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+    local _flags=($(_build_force_flags))
+    
+    if _cmd_sync "$_package" "${_flags[@]:-}"; then
+      _synced=$((_synced + 1))
+    else
+      u.error "✗ failed to sync $_package"
+      _failed=$((_failed + 1))
+    fi
+  done
+  
+  u.info "✓ sync-all complete: $_synced synced, $_failed failed"
+  [[ $_failed -gt 0 ]] && return $_E
+  return 0
+}
+
+##@ Update all tracked packages using their recorded package managers
+##@ Updates last_checked timestamp on successful completion for each package
+_cmd_update_all() {
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  # Get effective scopes for batch operations (excludes system scope)
+  local _effective_scopes
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _effective_scopes=($(_get_effective_batch_scopes))
+  
+  # Get packages filtered by effective scopes
+  local _packages
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _packages=($(_get_packages_by_scope "${_effective_scopes[@]}"))
+  [[ ${#_packages[@]} -eq 0 ]] && { u.info "no packages in scope: ${_effective_scopes[*]}"; return 0; }
+  
+  u.info "updating all packages (${#_packages[@]} in scopes: ${_effective_scopes[*]})"
+  
+  local _updated=0 _failed=0 _package
+  for _package in "${_packages[@]:-}"; do
+    [[ -z "$_package" ]] && continue
+    
+    u.info "updating $_package"
+    # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+    local _flags=($(_build_force_flags))
+    
+    if _cmd_update "$_package" "${_flags[@]:-}"; then
+      _updated=$((_updated + 1))
+    else
+      u.error "✗ failed to update $_package"
+      _failed=$((_failed + 1))
+    fi
+  done
+  
+  u.info "✓ update-all complete: $_updated updated, $_failed failed"
+  [[ $_failed -gt 0 ]] && return $_E
+  return 0
+}
+
+##@ Bootstrap package managers using pkgboot infrastructure
+##@ Installs package manager bootstraps (brew, mas, cargo, go, pipx, npm)
+_cmd_provision() {
+  local _manager="${1:-}"
+  
+  # Parse options
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  # If no manager specified, show available managers
+  if [[ -z "$_manager" ]]; then
+    u.info "Available package managers for provisioning:"
+    u.info "  brew      - Homebrew package manager (macOS manual bootstrap)"
+    u.info "  mas       - Mac App Store CLI (dogfooding via brew)"
+    u.info "  cargo     - Rust package manager (dogfooding via brew→rustup)"
+    u.info "  go        - Go programming language (dogfooding via system packages)"
+    u.info "  pipx      - Python application installer (dogfooding via system packages)"
+    u.info "  npm       - Node.js package manager (dogfooding via brew→nvm)"
+    u.info "  download  - Download manager (utility - validates curl/wget)"
+    u.info "  github    - GitHub manager (utility - validates GitHub API access)"
+    u.info "  script    - Script manager (utility - validates bash availability)"
+    u.info "  apt       - APT package manager (system dependency validation)"
+    u.info "  dnf       - DNF package manager (system dependency validation)"
+    u.info "  all       - Provision all available package managers"
+    u.info ""
+    u.info "Usage: pkgman provision <manager|all> [--force]"
+    u.info "Examples:"
+    u.info "  pkgman provision cargo"
+    u.info "  pkgman provision all"
+    u.info "  pkgman provision all --force"
+    return 0
+  fi
+  
+  # Handle "all" case
+  if [[ "$_manager" == "all" ]]; then
+    local _managers=(brew mas cargo go pipx npm download github script apt dnf)
+    # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+    local _provisioned=0 _failed=0 _flags=($(_build_force_flags))
+    
+    u.info "provisioning all package managers (${#_managers[@]} total)"
+    
+    local _mgr
+    for _mgr in "${_managers[@]}"; do
+      u.info "provisioning $_mgr..."
+      if _cmd_provision_manager "$_mgr" "${_flags[@]:-}"; then
+        _provisioned=$((_provisioned + 1))
+      else
+        u.error "✗ failed to provision $_mgr"
+        _failed=$((_failed + 1))
+      fi
+    done
+    
+    u.info "✓ provision-all complete: $_provisioned provisioned, $_failed failed"
+    [[ $_failed -gt 0 ]] && return $_E
+    return 0
+  fi
+  
+  # Single manager provisioning
+  _cmd_provision_manager "$_manager" "$@"
+}
+
+##@ Provision a single package manager
+_cmd_provision_manager() {
+  local _manager="${1:-}"
+  shift
+  
+  # Parse options for this function
+  local _force
+  _parse_force_flag "$@" || return $?
+  
+  # Validate manager
+  case "$_manager" in
+    brew|mas|cargo|go|pipx|npm|download|github|script|apt|dnf)
+      # Valid manager
+      ;;
+    *)
+      u.error "unsupported manager for provisioning: $_manager"
+      u.info "Supported managers: brew, mas, cargo, go, pipx, npm, download, github, script, apt, dnf, all"
+      return $_E_USG
+      ;;
+  esac
+  
+  u.info "provisioning $_manager package manager"
+  
+  # Use script manager to call pkgboot
+  local _manager_name="${_manager}-manager"
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  local _flags=($(_build_force_flags))
+  
+  # Check if manager is already tracked
+  if _is_tracked "$_manager_name"; then
+    u.info "$_manager_name already tracked"
+    # If force flag is set, proceed with install; otherwise just check status
+    if [[ "$_force" == "true" ]]; then
+      u.info "force flag set, proceeding with install"
+    else
+      local _current_status
+      _current_status=$(_get_package_status "$_manager_name")
+      if [[ "$_current_status" == "$_PKGMAN_STATUS_INSTALLED" ]]; then
+        u.info "✓ $_manager package manager already provisioned"
+        return 0
+      fi
+    fi
+  else
+    # Add the manager to tracking
+    if ! _cmd_add "script" "$_manager_name" --source "pkgboot" --dest "default" --target "$_manager" --scope "$PKGMAN_SCOPE_MANAGER" --detail "[internal] $_manager package manager"; then
+      u.error "failed to add $_manager_name to tracking"
+      return $_E
+    fi
+  fi
+  
+  if _cmd_install "$_manager_name" "${_flags[@]:-}"; then
+    u.info "✓ $_manager package manager provisioned successfully"
+    return 0
+  else
+    u.error "✗ failed to provision $_manager package manager"
+    return $_E
+  fi
+}
+##] operations-batch
+
+##@ Generate formatted list of supported managers for help display
+_get_supported_managers_display() {
+  printf '%s, ' "${PKGMAN_MANAGERS[@]:-}" | sed 's/, $//'
+  echo " (aliases: ghub→github, dnld→download)"
+}
+
+_help() {
+  cat << EOF
+$(_version) - Universal package manager CLI
+
+USAGE:
+    $__APP [--dry-run] [--no-track] <command> [options] [arguments]
+
+COMMANDS:
+    # Package Operations
+    add <manager> <package> [--source=<value>] [--dest=<path>] [--artifact=<name>] [--scope=<scope>] [--key=value...]
+                                        Add package to tracking with metadata
+    install <package> [--force]         Install tracked package using stored metadata
+    install <manifest> --host <h>       Ingest a manifest: add (if untracked) + install
+                                        (if missing) every tags-matching row
+    update <package> [--force]          Update tracked package using stored metadata
+    uninstall <package> [--force]       Uninstall tracked package but preserve metadata
+    remove <package> [--force]          Remove package from tracking completely
+    status <package>                    Show complete package information and metadata
+    info <package>                      Alias for status command
+    sync <package> [--force]            Sync tracked status with actual installation state
+    sync <manifest> --host <h> [--prune]
+                                        Converge: apply the manifest, then report (or, with
+                                        --prune, remove) tracked install_method=pkgman core
+                                        packages no longer declared by it
+
+    # Batch Operations  
+    install-all [--force]               Install all missing tracked packages (core scope only)
+    sync-all [--force]                  Sync status for all tracked packages (core + system scopes)
+    update-all [--force]                Update all tracked packages (core scope only)
+    list-all                            Show formatted table of all tracked packages
+    list                                Alias for list-all command
+    list-packages                       List package names only (for scripting)
+    list-scopes                         List all scopes used by tracked packages
+
+    # System Operations
+    provision <manager|all> [--force]   Bootstrap package managers (brew, mas, cargo, go, pipx, npm, all)
+
+GLOBAL OPTIONS:
+    -r, --dry-run       Preview actions without making changes
+    --dry-run=cmd       Skip package operations but update state files (for testing)
+    --no-track          Disable state tracking (for one-off operations)
+    --host <h>          Target host tag for manifest mode (REQUIRED with install/sync <manifest>)
+    --prune             With sync <manifest>: remove undeclared pkgman-managed core packages
+                          (report-only without this flag)
+    -h, --help          Show this help
+    -v, --version       Show version
+
+COMMAND OPTIONS:
+    --force             Force operation (reinstall, ignore status, etc.); for sync <manifest>
+                          --prune, skips the single confirmation prompt
+
+ADD COMMAND PARAMETERS:
+    <manager>           Package manager: brew, apt, dnf, github, download, mas, script, cargo, go, pipx, npm
+    <package>           Package name identifier
+    --source=<value>    Source specification (REQUIRED for github/download/mas/script/cargo/go/pipx/npm):
+                          github: owner/repo (e.g., obsidianmd/obsidian-releases)
+                          download: full URL (e.g., https://example.com/file.zip)
+                          mas: app store ID (e.g., 497799835)
+                          script: path to install script
+                          cargo: crate name (e.g., ripgrep)
+                          go: module path (e.g., github.com/user/repo@latest)
+                          pipx: package name (e.g., black)
+                          npm: package name (e.g., prettier)
+    --dest=<path>       Destination directory (REQUIRED for github/download/script)
+    --artifact=<name>   Final artifact name (REQUIRED for reliable uninstall)
+    --scope=<scope>     Package scope (default: core, options: core, system, custom alphanumeric)
+    --os=<os>           Target OS (default: default, options: default, mac, linux)
+    --sudo=<bool>       Requires sudo for installation (default: false, options: true, false)
+    --detail=<desc>     Package description (default: package name)
+    --selector=<glob>   Asset pattern for github releases (e.g., "*.dmg", "*linux*.tar.gz")
+    --extract=<bool>    Extract archives: true (default github), false (default download)
+    --version=<spec>    Version constraint (passed as kwarg to manager)
+    --<key>=<value>     Manager-specific options
+    
+MANAGER-SPECIFIC OPTIONS:
+    npm:
+      --registry=<url>  Custom npm registry URL (e.g., https://npm.pkg.github.com)
+      --npx=<bool>      Use npx execution mode instead of global install (default: false)
+
+SUPPORTED MANAGERS:
+    $(_get_supported_managers_display)
+
+EXAMPLES:
+    # Traditional Package Managers
+    $__APP add brew docker
+    $__APP add apt nginx
+    $__APP install docker
+    
+    # Scope Management
+    $__APP add brew jq --scope system              # System-level tool (excluded from batch operations)
+    $__APP add brew fzf --scope personal           # Personal scope  
+    $__APP list-scopes                             # Show all scopes in use
+    
+    # OS and Metadata Specification
+    $__APP add brew docker --os mac --detail "Container runtime for macOS"
+    $__APP add apt nginx --os linux --sudo true --detail "Web server"
+    $__APP add github obsidian --os default --detail "Knowledge management app"
+    
+    # GitHub Releases
+    $__APP add github obsidian --source obsidianmd/obsidian-releases --dest /Applications --artifact Obsidian.app --selector "*.dmg"
+    $__APP install obsidian
+    
+    # Direct Downloads  
+    $__APP add download zap-sh --source https://raw.githubusercontent.com/user/repo/main/zap-sh --dest /usr/local/bin --artifact zap-sh --extract false --exec true
+    $__APP install zap-sh
+    
+    # Mac App Store
+    $__APP add mas xcode --source 497799835 --artifact Xcode.app
+    $__APP install xcode
+    
+    # Script-based Installation
+    $__APP add script myapp --source /path/to/install-script.sh --dest /opt/myapp --artifact myapp-cli
+    $__APP install myapp
+    
+    # Development Tools
+    $__APP add cargo ripgrep --source ripgrep
+    $__APP add go goimports --source golang.org/x/tools/cmd/goimports@latest
+    $__APP add pipx black --source black
+    $__APP add npm prettier --source prettier
+    $__APP install ripgrep
+    
+    # NPM Package Management
+    $__APP add npm prettier --source prettier                    # Global install (default)
+    $__APP add npm typescript --source typescript --version "~4.9.0"  # With version constraint
+    $__APP add npm create-react-app --source create-react-app --npx true  # NPX execution mode
+    $__APP add npm @org/package --source @org/package --registry https://npm.pkg.github.com  # Custom registry
+    
+    # Individual Package Management
+    $__APP status obsidian         # Show complete package information
+    $__APP sync docker             # Sync tracked vs actual status
+    $__APP update obsidian --force # Force update
+    $__APP uninstall docker        # Uninstall but keep tracking
+    $__APP remove docker --force   # Remove from tracking completely
+    
+    # Batch Operations
+    $__APP install-all             # Install all missing packages
+    $__APP install-all --force     # Force reinstall all packages
+    $__APP sync-all                # Sync status for all packages  
+    $__APP update-all --force      # Force update all packages
+    $__APP list-all                # Show formatted package table
+    $__APP list-packages           # List names only (for scripting)
+    
+    # System Operations
+    $__APP provision cargo             # Bootstrap Rust package manager
+    $__APP provision all               # Bootstrap all package managers
+    $__APP provision all --force       # Force reinstall all package managers
+    $__APP --dry-run add github obsidian --source obsidianmd/obsidian-releases --dest /Applications --artifact Obsidian.app
+    $__APP --dry-run install-all   # Preview batch installation
+    $__APP --no-track install docker  # Install without state tracking
+
+WORKFLOW:
+    1. Add package with metadata:    add <manager> <package> [parameters]
+    2. Install tracked package:      install <package>
+    3. Manage lifecycle:             update/sync/status <package>
+    4. Batch operations:             install-all/update-all/sync-all
+    5. Remove when done:             uninstall/remove <package>
+
+CONFIGURATION:
+    Packages file:  \$PKGMAN_CONFIG_DIR/packages.cfg (metadata)
+    Status file:    \$PKGMAN_CONFIG_DIR/status.cfg (installation state)
+    Default config: \$XDG_CONFIG_HOME/pkgman or ~/.config/pkgman
+
+NOTE: pkgman manages global tools only. For project dependencies, use:
+    Python: requirements.txt, Pipfile, pyproject.toml
+    Rust: Cargo.toml  
+    Go: go.mod
+
+EOF
+}
+
+_version() { [[ "$__PIPED" == true ]] && echo "0.0.0" || sed -n 's/^# VERSION:[[:space:]]*\(.*\)/\1/p' "$__APPFILE" 2>/dev/null || echo "unknown"; }
+
+_cleanup() {
+  u.debug "cleanup"
+  return 0
+}
+##] functions
+
+##) app
+##( core
+_boot() {
+  [[ "$__PIPED" == true && "$__ALLOW_PIPED" == false ]] && { u.error "script is disabled in piped mode"; exit $_E_PIPE; }
+  printf '%s\n' "${__OS[@]:-}" | grep -Fxq "$(u.os)" || u.die "unsupported OS: $(u.os) [required: ${__OS[*]:-}]"
+  local _tool; for _tool in "${__APP_DEPS[@]:-}"; do u.require "$_tool"; done
+}
+
+trap _cleanup EXIT
+_boot
+_main "$@"
+##) core

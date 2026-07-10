@@ -1,0 +1,1818 @@
+#!/usr/bin/env bash
+##( header
+# --------------------------------------------------------------------
+# pkglib - Universal package/software management library
+#
+# Stateless library providing standardized interfaces for package
+# installation, updates, removal, and status checking across different
+# package managers and software sources. Uses loam library internally
+# for cross-platform compatibility and robust file operations.
+#
+# PARAMETER SEMANTICS:
+# All pkglib functions use a unified interface: <name> <force> [kwargs...]
+# where 'name' represents the package identifier that each manager understands:
+#   • brew/apt/dnf: package name (e.g., "docker", "nginx")
+#   • mas: App Store ID (e.g., "497799835")
+#   • cargo: crate name (e.g., "ripgrep")
+#   • go: module path (e.g., "golang.org/x/tools/cmd/goimports@latest")
+#   • pipx: Python package name (e.g., "black")
+#   • npm: npm package name (e.g., "prettier", "@anthropic-ai/claude-code")
+#   • github: repository path (e.g., "obsidianmd/obsidian-releases")
+#   • download: full URL (e.g., "https://example.com/file.zip")
+#   • script: executable script path (e.g., "/path/to/install.sh")
+#
+# ARCHITECTURE OVERVIEW:
+# • Common Templates: Traditional managers (brew/apt/dnf) use shared install/update/uninstall logic
+# • Execute Functions: All managers implement unified action mapping via pkglib.{manager}.execute
+# • Delegation Pattern: Complex managers (github) delegate to simpler ones (download) after URL resolution
+# • Status Constants: All functions return _PKGLIB_STATUS_INSTALLED or _PKGLIB_STATUS_MISSING
+# • Cross-Platform: OS-specific validation prevents incompatible installations
+#
+# Supports: brew, apt, dnf, mas (Mac App Store), cargo, go, pipx, npm, github, download, script
+# All functions require explicit parameters - no state or auto-detection.
+# For stateful operations with auto-detection, use pkgman CLI.
+# --------------------------------------------------------------------
+# AUTHOR: Budha <budhash@gmail.com>
+# VERSION: 1.0.0
+# LICENSE: MIT License
+# --------------------------------------------------------------------
+##) header
+
+# shellcheck disable=SC1090,SC2154 # loam is sourced from a runtime-resolved path ($LOAM or in-repo relative); location can't be known statically. _E/_E_USG/_E_DEP/_E_NF/_E_NP/_E_OS are defined by loam at source time; verified live by tests.sh
+##( configuration
+# Include guard to prevent multiple sourcing
+[[ -n "${PKGLIB_LOADED:-}" ]] && return 0
+readonly PKGLIB_LOADED=1
+
+# Source loam library dependency ($LOAM > in-repo relative > error)
+if [[ -n "${LOAM:-}" && -f "$LOAM" ]]; then
+  source "$LOAM" || { echo "Error: failed to load loam ($LOAM)" >&2; exit 1; }
+elif [[ -f "${BASH_SOURCE[0]%/*}/../lib/common/loam/loam" ]]; then
+  source "${BASH_SOURCE[0]%/*}/../lib/common/loam/loam" || { echo "Error: failed to load loam" >&2; exit 1; }
+else
+  echo "Error: loam library not found (set \$LOAM or run from the shed tree)" >&2; exit 1
+fi
+if ! command -v loam.smart-download &>/dev/null; then
+  echo "Error: loam.smart-download not found - ensure loam is properly loaded" >&2; exit 1
+fi
+##) configuration
+
+##( constants
+##@ Common status constants
+readonly _PKGLIB_STATUS_INSTALLED="installed"
+readonly _PKGLIB_STATUS_MISSING="missing"
+##@ Action constants
+readonly _PKGLIB_ACTION_INSTALL="install"
+readonly _PKGLIB_ACTION_REINSTALL="reinstall"
+readonly _PKGLIB_ACTION_UPDATE="update"
+readonly _PKGLIB_ACTION_REUPDATE="reupdate" # force update
+readonly _PKGLIB_ACTION_UNINSTALL="uninstall"
+
+##@ GitHub API constants
+readonly _PKGLIB_GITHUB_API_BASE="https://api.github.com"
+##) constants
+
+##( helpers
+##@ Maps a manager name to the CLI tool that implements it (managers without their own binary).
+##: _pkglib.manager_tool <manager> -> tool=$(_pkglib.manager_tool cask)
+_pkglib.manager_tool() {
+  case "$1" in
+    cask) echo "brew" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+##@ Check if required tool is available
+##: _pkglib.require_tool <tool> -> _pkglib.require_tool brew
+_pkglib.require_tool() {
+  local _tool="$1"
+  [[ -z "$_tool" ]] && { _error "tool name required"; return $_E_USG; }
+  
+  command -v "$_tool" &>/dev/null && return 0
+  _error "dependency not found: $_tool"
+  return $_E_DEP
+}
+
+##@ Validate required parameters
+##: _pkglib.require_params <name> <value> [name2] [value2] -> _pkglib.require_params "package name" "$_name"
+_pkglib.require_params() {
+  while [[ $# -gt 0 ]]; do
+    local _param_name="$1"
+    local _param_value="$2"
+    [[ -z "$_param_value" ]] && { _error "$_param_name required"; return $_E_USG; }
+    shift 2
+  done
+}
+
+##@ Validate URL format
+##: _pkglib.validate_url <url> -> _pkglib.validate_url "https://example.com/file"
+_pkglib.validate_url() {
+  local _url="$1"
+  [[ -z "$_url" ]] && { _error "URL required"; return $_E_USG; }
+  
+  # Check for basic URL format (http/https/ftp)
+  if [[ ! "$_url" =~ ^(https?|ftp)://[a-zA-Z0-9.-]+[a-zA-Z0-9._/-]*$ ]]; then
+    _error "invalid URL format: '$_url'"
+    return $_E_USG
+  fi
+}
+
+##@ Generic parameter extraction helpers for cleaner kwargs handling
+##@ Extract single parameter value from kwargs
+##: _pkglib.get_arg <param_name> <required> "$@" -> value=$(_pkglib.get_arg source true "$@")
+_pkglib.get_arg() {
+  local _param_name="$1" _required="$2"
+  shift 2
+  
+  local _value=""
+  if [[ $# -gt 0 ]]; then
+    local _arg
+    for _arg in "$@"; do
+      case "$_arg" in
+        --${_param_name}=*)
+          _value="${_arg#*=}"
+          break
+          ;;
+      esac
+    done
+  fi
+  
+  # Check if required parameter is missing
+  if [[ "$_required" == "true" && -z "$_value" ]]; then
+    _error "missing required parameter: --$_param_name"
+    return $_E_USG
+  fi
+  
+  echo "$_value"
+}
+
+##@ Extract required parameter value from kwargs (errors if missing)
+##: _pkglib.get_arg_rqd <param_name> "$@" -> value=$(_pkglib.get_arg_rqd source "$@")
+_pkglib.get_arg_rqd() {
+  local _param_name="$1"
+  shift
+  _pkglib.get_arg "$_param_name" true "$@"
+}
+
+##@ Extract optional parameter value from kwargs with default
+##: _pkglib.get_arg_opt <param_name> <default> "$@" -> value=$(_pkglib.get_arg_opt dest "." "$@")
+_pkglib.get_arg_opt() {
+  local _param_name="$1" _default="$2"
+  shift 2
+  local _value
+  _value=$(_pkglib.get_arg "$_param_name" false "$@")
+  echo "${_value:-$_default}"
+}
+
+##@ Extract optional parameter value from kwargs (no default, can be empty)
+##: _pkglib.get_arg_maybe <param_name> "$@" -> value=$(_pkglib.get_arg_maybe checksum "$@")
+_pkglib.get_arg_maybe() {
+  local _param_name="$1"
+  shift
+  _pkglib.get_arg "$_param_name" false "$@"
+}
+
+##@ Generate display string for kwargs arguments
+##: _pkglib.get_args_display "$@" -> display=$(_pkglib.get_args_display "$@")
+_pkglib.get_args_display() {
+  if [[ $# -gt 0 ]]; then
+    echo "$*"
+  else
+    echo "no additional args"
+  fi
+}
+
+##@ Convert shell glob pattern to regex pattern for grep
+##: _pkglib.convert_glob_to_regex <pattern> -> regex=$(_pkglib.convert_glob_to_regex "*.dmg")
+_pkglib.convert_glob_to_regex() {
+  local _pattern="$1"
+  [[ -z "$_pattern" ]] && { _error "pattern required"; return $_E_USG; }
+  
+  # Escape regex special characters except * and ?
+  _pattern="${_pattern//\\/\\\\}"
+  _pattern="${_pattern//\./\\.}"
+  _pattern="${_pattern//\[/\\[}"
+  _pattern="${_pattern//\]/\\]}"
+  _pattern="${_pattern//\^/\\^}"
+  _pattern="${_pattern//\$/\\$}"
+  _pattern="${_pattern//\+/\\+}"
+  _pattern="${_pattern//\(/\\(}"
+  _pattern="${_pattern//\)/\\)}"
+  _pattern="${_pattern//\{/\\{}"
+  _pattern="${_pattern//\}/\\}"
+  _pattern="${_pattern//\|/\\|}"
+  
+  # Convert glob wildcards to regex
+  _pattern="${_pattern//\*/.*}"
+  _pattern="${_pattern//\?/.}"
+  
+  echo "$_pattern"
+}
+
+##@ Check if package installation should be skipped (already installed, non-force mode)
+##: _pkglib.already_installed <name> <check_command> -> _pkglib.already_installed "docker" "brew list docker"
+_pkglib.already_installed() {
+  local _name="$1" _check_cmd="$2"
+  [[ -z "$_name" ]] && { _error "package name required"; return $_E_USG; }
+  [[ -z "$_check_cmd" ]] && { _error "check command required"; return $_E_USG; }
+  
+  if eval "$_check_cmd" &>/dev/null; then
+    _log "already installed: $_name"
+    return 0
+  fi
+  return 1
+}
+
+##@ Validate script exists and is executable
+##: _pkglib.ensure_executable <script_path> -> _pkglib.ensure_executable "/path/to/script.sh"
+_pkglib.ensure_executable() {
+  local _file="$1"
+  [[ -z "$_file" ]] && { _error "script path required"; return $_E_USG; }
+  [[ ! -f "$_file" ]] && { _error "script not found: $_file"; return $_E_NF; }
+  [[ ! -x "$_file" ]] && { _error "script not executable: $_file"; return $_E_NP; }
+  return 0
+}
+
+##@ Check if kwargs array has content
+##: _pkglib.has_kwargs kwargs_array -> _pkglib.has_kwargs "${_kwargs[@]}"
+_pkglib.has_kwargs() {
+  [[ $# -gt 0 && -n "${1:-}" ]]
+}
+
+##@ Filter out pkgman-specific parameters from kwargs array (bash 3.2 compatible)
+##@ Usage: _filtered=($(_pkglib.filter_kwargs "$@")) 
+##@ Usage: _filtered=($(_pkglib.filter_kwargs --npx --version "$@"))  # with custom filters
+##@ Standard filtered parameters: --os, --dest, --artifact, --scope, --sudo, --detail
+_pkglib.filter_kwargs() {
+  local _custom_filters=()
+  
+  # Collect custom filter parameters (those starting with --)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --*)
+        # Check if this is a filter specification (no = sign, just --param)
+        if [[ "$1" != *"="* ]]; then
+          _custom_filters+=("$1")
+          shift
+        else
+          # This is actual kwarg data, stop collecting filters
+          break
+        fi
+        ;;
+      *)
+        # Non-option argument, stop collecting filters
+        break
+        ;;
+    esac
+  done
+  
+  # Standard pkgman parameters to always filter out
+  local _standard_filters=(--os --dest --artifact --scope --sudo --detail)
+  
+  # Process remaining arguments (the actual kwargs to filter)
+  local _arg
+  for _arg in "$@"; do
+    local _should_filter=false
+    
+    # Check against standard filters
+    local _filter
+    for _filter in "${_standard_filters[@]}"; do
+      if [[ "$_arg" == "$_filter" || "$_arg" == "$_filter="* ]]; then
+        _should_filter=true
+        break
+      fi
+    done
+    
+    # Check against custom filters if not already filtered
+    if [[ "$_should_filter" == "false" && ${#_custom_filters[@]} -gt 0 ]]; then
+      for _filter in "${_custom_filters[@]}"; do
+        if [[ "$_arg" == "$_filter" || "$_arg" == "$_filter="* ]]; then
+          _should_filter=true
+          break
+        fi
+      done
+    fi
+    
+    # Output argument if not filtered
+    [[ "$_should_filter" == "false" ]] && echo "$_arg"
+  done
+}
+
+##@ Resolve script source path with fallback search
+##: _pkglib.resolve_source_path <source> -> resolved_path=$(_pkglib.resolve_source_path "pkgboot")
+_pkglib.resolve_source_path() {
+  local _source="$1"
+  [[ -z "$_source" ]] && { _error "source path required"; return $_E_USG; }
+  
+  # If already absolute path, use directly
+  if [[ "$_source" == /* ]]; then
+    echo "$_source"
+    return 0
+  fi
+  
+  # Search priority order for relative paths:
+  local _search_paths=(
+    # 1. Relative to current script's bin directory (for pkglib in lib/, check ../bin/)
+    "$(dirname "${BASH_SOURCE[0]}")/../bin/$_source"
+    # 2. Relative to current script's ins directory (for pkglib in lib/, check ../ins/)  
+    "$(dirname "${BASH_SOURCE[0]}")/../ins/$_source"
+    # 3. Standard locations
+    "$HOME/.local/bin/$_source"
+    "/usr/local/bin/$_source"
+  )
+  
+  local _path
+  for _path in "${_search_paths[@]}"; do
+    # Resolve any .. paths
+    _path="$(realpath "$_path" 2>/dev/null || echo "$_path")"
+    if [[ -f "$_path" && -x "$_path" ]]; then
+      echo "$_path"
+      return 0
+    fi
+  done
+  
+  # 4. Finally try PATH lookup
+  if command -v "$_source" &>/dev/null; then
+    command -v "$_source"
+    return 0
+  fi
+  
+  _error "script not found: $_source (searched: ${_search_paths[*]} and PATH)"
+  return $_E_NF
+}
+
+##) helpers
+
+##( managers
+##[ common
+##@ common install flow
+##: pkglib.common.install <manager> <name> <force> [--key=value...] -> pkglib.common.install brew docker true --cask
+pkglib.common.install() {
+  local _manager="$1" _name="$2" _force="$3"
+  _pkglib.require_params "manager" "$_manager" "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 3
+  
+  local _kwargs=("$@")
+  _pkglib.require_tool "$(_pkglib.manager_tool "$_manager")" || return $_E_DEP
+  
+  # Action
+  _log "installing package - $_manager: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+  
+  # Check if already installed first
+  local _status
+  _status=$(pkglib.${_manager}.status "$_name" "false" "${_kwargs[@]+"${_kwargs[@]}"}")
+
+  if [[ "$_status" == "$_PKGLIB_STATUS_INSTALLED" ]]; then
+    if [[ "$_force" == "true" ]]; then
+      # Already installed + force = reinstall
+      pkglib.${_manager}.execute "$_PKGLIB_ACTION_REINSTALL" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
+    else
+      # Already installed + no force = skip
+      _log "already installed: $_name"
+      return 0
+    fi
+  else
+    # Not installed = install (ignore force flag)
+    pkglib.${_manager}.execute "$_PKGLIB_ACTION_INSTALL" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
+  fi
+  
+  _log "✓ $_manager package installed: $_name"
+  return 0
+}
+
+##@ common update flow
+##: pkglib.common.update <manager> <name> <force> [--key=value...] -> pkglib.common.update brew docker true --cask
+pkglib.common.update() {
+  local _manager="$1" _name="$2" _force="$3"
+  _pkglib.require_params "manager" "$_manager" "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 3
+  
+  local _kwargs=("$@")
+  _pkglib.require_tool "$(_pkglib.manager_tool "$_manager")" || return $_E_DEP
+  
+  # Action
+  _log "updating package - $_manager: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+  
+  if [[ "$_force" == "true" ]]; then
+    # Force update = reinstall/force update
+    pkglib.${_manager}.execute "$_PKGLIB_ACTION_REUPDATE" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
+  else
+    # Regular update
+    pkglib.${_manager}.execute "$_PKGLIB_ACTION_UPDATE" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
+  fi
+  
+  _log "✓ $_manager package updated: $_name"
+  return 0
+}
+
+##@ common uninstall flow
+##: pkglib.common.uninstall <manager> <name> <force> [--key=value...] -> pkglib.common.uninstall brew docker false --cask
+pkglib.common.uninstall() {
+  local _manager="$1" _name="$2" _force="$3"
+  _pkglib.require_params "manager" "$_manager" "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 3
+  
+  local _kwargs=("$@")
+  _pkglib.require_tool "$(_pkglib.manager_tool "$_manager")" || return $_E_DEP
+  
+  # Action
+  _log "uninstalling package - $_manager: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+  
+  # Most package managers don't use kwargs for uninstall to avoid failures
+  # Pass all kwargs to execute function for source parameter extraction
+  pkglib.${_manager}.execute "$_PKGLIB_ACTION_UNINSTALL" "$_name" "${_kwargs[@]+"${_kwargs[@]}"}" || { _error "$_manager execute failed"; return $_E; }
+  
+  _log "✓ $_manager package uninstalled: $_name"
+  return 0
+}
+
+##] common
+
+##[ brew
+##@ Validate brew package parameters before installation
+##: pkglib.brew.validate <name> <force> [kwargs...] -> pkglib.brew.validate docker true --cask
+pkglib.brew.validate() {
+  local _name="$1" _force="$2"  # _name is package name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+  
+  # Brew is macOS only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "linux" ]] && { _error "brew packages cannot be installed on Linux"; return $_E_OS; }
+  
+  return 0
+}
+
+##@ brew command execution with kwargs handling
+##: pkglib.brew.execute <action> <name> [kwargs...] -> pkglib.brew.execute install docker --cask
+pkglib.brew.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _command _append_kwargs=true
+  
+  # Map pkglib actions to brew commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="reinstall" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="upgrade" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="reinstall"; _append_kwargs=false ;;  # Force update = reinstall for brew
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall"; _append_kwargs=false ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  # Execute brew command with or without kwargs
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+    _debug "brew $_command $_name ${_filtered_kwargs[@]}"
+    brew "$_command" "$_name" "${_filtered_kwargs[@]}" || { _error "brew $_command failed: $_name"; return $_E; }
+  else
+    _debug "brew $_command $_name"
+    brew "$_command" "$_name" || { _error "brew $_command failed: $_name"; return $_E; }
+  fi
+  
+  return 0
+}
+
+##@ brew status
+##: pkglib.brew.status <name> <force> [--key=value...] -> status=$(pkglib.brew.status docker false --cask)
+pkglib.brew.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "brew" || return $_E_DEP
+  
+  # Action - status checking doesn't need kwargs
+  _debug "brew list $_name"
+  brew list "$_name" &>/dev/null && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+
+##@ brew installation
+##: pkglib.brew.install <name> <force> [--key=value...] -> pkglib.brew.install docker true --cask
+pkglib.brew.install() {
+  pkglib.common.install "brew" "$@"
+}
+
+##@ brew update (upgrade or reinstall with force)
+##: pkglib.brew.update <name> <force> [--key=value...] -> pkglib.brew.update docker true --cask
+pkglib.brew.update() {
+  pkglib.common.update "brew" "$@"
+}
+
+##@ brew uninstallation
+##: pkglib.brew.uninstall <name> <force> [--key=value...] -> pkglib.brew.uninstall docker false --cask
+pkglib.brew.uninstall() {
+  pkglib.common.uninstall "brew" "$@"
+}
+##] brew
+
+##[ cask
+##@ Validate cask package parameters before installation
+##: pkglib.cask.validate <name> <force> [kwargs...] -> pkglib.cask.validate vscode true
+pkglib.cask.validate() {
+  local _name="$1" _force="$2"  # _name is cask name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+
+  # Cask is macOS only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "linux" ]] && { _error "cask packages cannot be installed on Linux"; return $_E_OS; }
+
+  # Verify brew is available (cask requires Homebrew)
+  loam.has brew || { _error "cask requires Homebrew"; return $_E_DEP; }
+
+  return 0
+}
+
+##@ cask command execution with kwargs handling
+##: pkglib.cask.execute <action> <name> [kwargs...] -> pkglib.cask.execute install vscode
+pkglib.cask.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+
+  local _command _append_kwargs=true
+
+  # Map pkglib actions to brew cask commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="reinstall" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="upgrade" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="reinstall"; _append_kwargs=false ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall"; _append_kwargs=false ;;
+    *) _error "cask: unknown action $_action"; return $_E ;;
+  esac
+
+  # Execute brew cask command with or without kwargs
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+    _debug "brew $_command --cask $_name ${_filtered_kwargs[@]}"
+    brew "$_command" --cask "$_name" "${_filtered_kwargs[@]}" || { _error "brew $_command --cask failed: $_name"; return $_E; }
+  else
+    _debug "brew $_command --cask $_name"
+    brew "$_command" --cask "$_name" || { _error "brew $_command --cask failed: $_name"; return $_E; }
+  fi
+
+  return 0
+}
+
+##@ cask installation
+##: pkglib.cask.install <name> <force> [--key=value...] -> pkglib.cask.install vscode true
+pkglib.cask.install() {
+  pkglib.common.install "cask" "$@"
+}
+
+##@ cask update (upgrade or reinstall with force)
+##: pkglib.cask.update <name> <force> [--key=value...] -> pkglib.cask.update vscode true
+pkglib.cask.update() {
+  pkglib.common.update "cask" "$@"
+}
+
+##@ cask uninstallation
+##: pkglib.cask.uninstall <name> <force> [--key=value...] -> pkglib.cask.uninstall vscode false
+pkglib.cask.uninstall() {
+  pkglib.common.uninstall "cask" "$@"
+}
+
+##@ cask status
+##: pkglib.cask.status <name> <force> [--key=value...] -> status=$(pkglib.cask.status vscode false)
+pkglib.cask.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "brew" || return $_E_DEP
+
+  # Action - status checking doesn't need kwargs
+  _debug "brew list --cask --versions $_name"
+  brew list --cask --versions "$_name" >/dev/null 2>&1 && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] cask
+
+##[ apt
+##@ Validate apt package parameters before installation
+##: pkglib.apt.validate <name> <force> [kwargs...] -> pkglib.apt.validate nginx true
+pkglib.apt.validate() {
+  local _name="$1" _force="$2"  # _name is package name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+  
+  # APT is Linux only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "mac" ]] && { _error "apt packages cannot be installed on macOS"; return $_E_OS; }
+  
+  return 0
+}
+
+##@ apt command execution with kwargs handling
+##: pkglib.apt.execute <action> <name> [kwargs...] -> pkglib.apt.execute install nginx --install-suggests
+pkglib.apt.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _command _append_kwargs=true
+  
+  # Map pkglib actions to apt commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="install --reinstall" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="install --only-upgrade" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="install --reinstall"; _append_kwargs=false ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="remove"; _append_kwargs=false ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  # Execute apt command with or without kwargs - respect sudo parameter
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  # Check if sudo is explicitly requested
+  local _use_sudo
+  _use_sudo=$(_pkglib.get_arg_opt sudo "false" "$@")
+
+  if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+    _debug "apt $_command $_name ${_filtered_kwargs[@]} (sudo: $_use_sudo)"
+    if [[ "$_use_sudo" == "true" ]]; then
+      sudo apt $_command -y "$_name" "${_filtered_kwargs[@]}" || { _error "apt $_command failed: $_name"; return $_E; }
+    else
+      apt $_command -y "$_name" "${_filtered_kwargs[@]}" || { _error "apt $_command failed: $_name"; return $_E; }
+    fi
+  else
+    _debug "apt $_command $_name (sudo: $_use_sudo)"
+    if [[ "$_use_sudo" == "true" ]]; then
+      sudo apt $_command -y "$_name" || { _error "apt $_command failed: $_name"; return $_E; }
+    else
+      apt $_command -y "$_name" || { _error "apt $_command failed: $_name"; return $_E; }
+    fi
+  fi
+  
+  return 0
+}
+
+##@ apt installation
+##: pkglib.apt.install <name> <force> [--key=value...] -> pkglib.apt.install nginx true --install-suggests
+pkglib.apt.install() {
+  pkglib.common.install "apt" "$@"
+}
+
+##@ apt update (upgrade or reinstall with force)
+##: pkglib.apt.update <name> <force> [--key=value...] -> pkglib.apt.update nginx true --install-suggests
+pkglib.apt.update() {
+  pkglib.common.update "apt" "$@"
+}
+
+##@ apt uninstallation
+##: pkglib.apt.uninstall <name> <force> [--key=value...] -> pkglib.apt.uninstall nginx false --purge
+pkglib.apt.uninstall() {
+  pkglib.common.uninstall "apt" "$@"
+}
+
+##@ apt status
+##: pkglib.apt.status <name> <force> [--key=value...] -> status=$(pkglib.apt.status nginx false)
+pkglib.apt.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "apt" || return $_E_DEP
+
+  # Action - status checking doesn't need kwargs
+  dpkg -l "$_name" &>/dev/null && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] apt
+
+##[ dnf
+##@ Validate dnf package parameters before installation
+##: pkglib.dnf.validate <name> <force> [kwargs...] -> pkglib.dnf.validate docker true
+pkglib.dnf.validate() {
+  local _name="$1" _force="$2"  # _name is package name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+  
+  # DNF is Linux only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "mac" ]] && { _error "dnf packages cannot be installed on macOS"; return $_E_OS; }
+  
+  return 0
+}
+
+##@ dnf command execution with kwargs handling
+##: pkglib.dnf.execute <action> <name> [kwargs...] -> pkglib.dnf.execute install docker --enablerepo=epel
+pkglib.dnf.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _command _append_kwargs=true
+  
+  # Map pkglib actions to dnf commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="reinstall" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="update" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="reinstall"; _append_kwargs=false ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="remove"; _append_kwargs=false ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  # Execute dnf command with or without kwargs - respect sudo parameter
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  # Check if sudo is explicitly requested
+  local _use_sudo
+  _use_sudo=$(_pkglib.get_arg_opt sudo "false" "$@")
+
+  if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+    _debug "dnf $_command $_name ${_filtered_kwargs[@]} (sudo: $_use_sudo)"
+    if [[ "$_use_sudo" == "true" ]]; then
+      sudo dnf $_command -y "$_name" "${_filtered_kwargs[@]}" || { _error "dnf $_command failed: $_name"; return $_E; }
+    else
+      dnf $_command -y "$_name" "${_filtered_kwargs[@]}" || { _error "dnf $_command failed: $_name"; return $_E; }
+    fi
+  else
+    _debug "dnf $_command $_name (sudo: $_use_sudo)"
+    if [[ "$_use_sudo" == "true" ]]; then
+      sudo dnf $_command -y "$_name" || { _error "dnf $_command failed: $_name"; return $_E; }
+    else
+      dnf $_command -y "$_name" || { _error "dnf $_command failed: $_name"; return $_E; }
+    fi
+  fi
+  
+  return 0
+}
+
+##@ dnf installation
+##: pkglib.dnf.install <name> <force> [--key=value...] -> pkglib.dnf.install docker true --enablerepo=epel
+pkglib.dnf.install() {
+  pkglib.common.install "dnf" "$@"
+}
+
+##@ dnf update (upgrade or reinstall with force)
+##: pkglib.dnf.update <name> <force> [--key=value...] -> pkglib.dnf.update docker true --enablerepo=epel
+pkglib.dnf.update() {
+  pkglib.common.update "dnf" "$@"
+}
+
+##@ dnf uninstallation
+##: pkglib.dnf.uninstall <name> <force> [--key=value...] -> pkglib.dnf.uninstall docker false
+pkglib.dnf.uninstall() {
+  pkglib.common.uninstall "dnf" "$@"
+}
+
+##@ dnf status
+##: pkglib.dnf.status <name> <force> [--key=value...] -> status=$(pkglib.dnf.status docker false)
+pkglib.dnf.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "dnf" || return $_E_DEP
+  
+  # Action - status checking doesn't need kwargs
+  _debug "dnf list installed $_name"
+  dnf list installed "$_name" &>/dev/null && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] dnf
+
+##[ mas
+##@ Validate mas package parameters before installation
+##: pkglib.mas.validate <name> <force> [kwargs...] -> pkglib.mas.validate "xcode" "false"
+pkglib.mas.validate() {
+  local _name="$1" _force="$2"  # _name is App Store ID
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+  
+  # MAS is macOS only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "linux" ]] && { _error "mas packages cannot be installed on Linux"; return $_E_OS; }
+  
+  return 0
+}
+
+##@ Validate mas app ID (numeric)
+##: _pkglib.validate_app_id <app_id> -> _pkglib.validate_app_id "497799835"  
+_pkglib.validate_app_id() {
+  local _app_id="$1"
+  [[ -z "$_app_id" ]] && { _error "app ID required"; return $_E_USG; }
+  
+  # Check that it's numeric only
+  if [[ ! "$_app_id" =~ ^[0-9]+$ ]]; then
+    _error "invalid app ID: '$_app_id' (must be numeric)"
+    return $_E_USG
+  fi
+  
+  # Check reasonable length (App Store IDs are typically 9-10 digits)
+  if [[ ${#_app_id} -lt 6 || ${#_app_id} -gt 12 ]]; then
+    _error "invalid app ID length: '$_app_id' (expected 6-12 digits)"
+    return $_E_USG
+  fi
+}
+
+##@ mas command execution with kwargs handling
+##: pkglib.mas.execute <action> <name> [kwargs...] -> pkglib.mas.execute install xcode --source=497799835
+pkglib.mas.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _kwargs=("$@")
+  local _command _append_kwargs=true
+  
+  # Use source directly from first parameter (App Store ID)
+  local _source="$_name"
+  
+  # Validate app ID
+  _pkglib.validate_app_id "$_source" || return $?
+  
+  # Map pkglib actions to mas commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="install" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="upgrade" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="upgrade" ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall"; _append_kwargs=false ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  # Execute mas command - mas doesn't use kwargs, only the app ID
+  if [[ "$_command" == "uninstall" ]]; then
+    _debug "sudo mas $_command $_source"
+    sudo mas "$_command" "$_source" || { _error "mas $_command failed: $_name"; return $_E; }
+  else
+    _debug "mas $_command $_source"
+    mas "$_command" "$_source" || { _error "mas $_command failed: $_name"; return $_E; }
+  fi
+  
+  return 0
+}
+
+##@ mas installation
+##: pkglib.mas.install <name> <force> [--key=value...] -> pkglib.mas.install xcode true --source=497799835
+pkglib.mas.install() {
+  pkglib.common.install "mas" "$@"
+}
+
+##@ mas update (upgrade or reinstall with force)
+##: pkglib.mas.update <name> <force> [--key=value...] -> pkglib.mas.update xcode true --source=497799835
+pkglib.mas.update() {
+  pkglib.common.update "mas" "$@"
+}
+
+##@ mas uninstallation
+##: pkglib.mas.uninstall <name> <force> [--key=value...] -> pkglib.mas.uninstall xcode false --source=497799835
+pkglib.mas.uninstall() {
+  pkglib.common.uninstall "mas" "$@"
+}
+
+##@ mas status
+##: pkglib.mas.status <name> <force> [--key=value...] -> status=$(pkglib.mas.status 497799835 false)
+pkglib.mas.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "mas" || return $_E_DEP
+  
+  # Validate app ID (pkgman passes App Store ID as _name)
+  _pkglib.validate_app_id "$_name" || return $?
+  
+  # Action - status checking doesn't need kwargs
+  mas list | grep -q "^$_name " && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] mas
+
+##[ cargo
+##@ Validate cargo package parameters before installation
+##: pkglib.cargo.validate <name> <force> [kwargs...] -> pkglib.cargo.validate "ripgrep" "false" "--dest=/some/path"
+pkglib.cargo.validate() {
+  local _name="$1" _force="$2"  # _name is crate name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract dest if provided to show warning
+  local _dest
+  _dest=$(_pkglib.get_arg_maybe dest "$@")
+  
+  # Warn if dest is set - cargo installs to ~/.cargo/bin by default
+  [[ -n "$_dest" && "$_dest" != "default" ]] && _warn "cargo ignores --dest parameter, installs to \$CARGO_HOME/bin (default: ~/.cargo/bin)"
+  
+  return 0
+}
+
+##@ cargo command execution with kwargs handling
+##: pkglib.cargo.execute <action> <name> [kwargs...] -> pkglib.cargo.execute install ripgrep --source=ripgrep
+pkglib.cargo.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _command _append_kwargs=true  # cargo supports kwargs like --features, --version, --root
+  local _force_flag=""
+  
+  # Use source directly from first parameter (crate name)
+  local _source="$_name"
+  
+  # Map pkglib actions to cargo commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="install"; _force_flag="--force" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="install"; _force_flag="--force" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="install"; _force_flag="--force" ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall" ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  # Execute cargo command with or without kwargs
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  if [[ -n "${_force_flag:-}" ]]; then
+    if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+      _debug "cargo $_command $_force_flag $_source ${_filtered_kwargs[@]}"
+      cargo "$_command" "$_force_flag" "$_source" "${_filtered_kwargs[@]}" || { _error "cargo $_command $_force_flag failed: $_name"; return $_E; }
+    else
+      _debug "cargo $_command $_force_flag $_source"
+      cargo "$_command" "$_force_flag" "$_source" || { _error "cargo $_command $_force_flag failed: $_name"; return $_E; }
+    fi
+  else
+    if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+      _debug "cargo $_command $_source ${_filtered_kwargs[@]}"
+      cargo "$_command" "$_source" "${_filtered_kwargs[@]}" || { _error "cargo $_command failed: $_name"; return $_E; }
+    else
+      _debug "cargo $_command $_source"
+      cargo "$_command" "$_source" || { _error "cargo $_command failed: $_name"; return $_E; }
+    fi
+  fi
+  
+  return 0
+}
+
+##@ cargo installation
+##: pkglib.cargo.install <name> <force> [--key=value...] -> pkglib.cargo.install ripgrep true --source=ripgrep
+pkglib.cargo.install() {
+  pkglib.common.install "cargo" "$@"
+}
+
+##@ cargo update (reinstall with force)
+##: pkglib.cargo.update <name> <force> [--key=value...] -> pkglib.cargo.update ripgrep true --source=ripgrep
+pkglib.cargo.update() {
+  pkglib.common.update "cargo" "$@"
+}
+
+##@ cargo uninstallation
+##: pkglib.cargo.uninstall <name> <force> [--key=value...] -> pkglib.cargo.uninstall ripgrep false --source=ripgrep
+pkglib.cargo.uninstall() {
+  pkglib.common.uninstall "cargo" "$@"
+}
+
+##@ cargo status
+##: pkglib.cargo.status <name> <force> [--key=value...] -> status=$(pkglib.cargo.status ripgrep false)
+pkglib.cargo.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "cargo" || return $_E_DEP
+  
+  # Action - status checking doesn't need kwargs (pkgman passes crate name as _name)
+  cargo install --list | grep -q "^$_name v" && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] cargo
+
+##[ go
+##@ Go Manager - Module Path vs Binary Name Handling
+##@
+##@ IMPORTANT: The go manager has a unique architectural challenge:
+##@ • INSTALL requires the full module path: go install golang.org/x/tools/cmd/goimports@latest
+##@ • UNINSTALL requires the binary name: rm $GOBIN/goimports (manual binary removal)
+##@ • STATUS checks require the binary name: test -f $GOBIN/goimports
+##@
+##@ This is different from other language managers:
+##@ • cargo: cargo install/uninstall both use crate name (ripgrep)
+##@ • pipx: pipx install/uninstall both use package name (black)  
+##@ • npm: npm install/uninstall both use package name (prettier)
+##@
+##@ SOLUTION: Use --artifact parameter to specify binary name explicitly:
+##@ pkgman add go goimports --source="golang.org/x/tools/cmd/goimports@latest" --artifact="goimports"
+##@
+##@ FALLBACK: If --artifact not provided, extract binary name from module path:
+##@ golang.org/x/tools/cmd/goimports@latest → goimports (may not always be correct)
+##@
+
+##@ Extract binary name from go module path with artifact override
+##: _pkglib.go.get_binary_name <module_path> [--artifact=name] -> binary_name
+_pkglib.go.get_binary_name() {
+  local _module_path="$1"
+  shift
+  
+  # Extract artifact parameter
+  local _artifact
+  _artifact=$(_pkglib.get_arg_maybe artifact "$@")
+  
+  # Use artifact if provided, otherwise extract from module path
+  if [[ -n "$_artifact" ]]; then
+    echo "$_artifact"
+  else
+    # Fallback: extract from module path
+    local _binary_name="${_module_path##*/}"
+    _binary_name="${_binary_name%@*}"
+    echo "$_binary_name"
+  fi
+}
+
+##@ Validate go package parameters before installation
+##: pkglib.go.validate <name> <force> [kwargs...] -> pkglib.go.validate "golang.org/x/tools/cmd/goimports@latest" "false" "--artifact=goimports"
+pkglib.go.validate() {
+  local _name="$1" _force="$2"  # _name is module path
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract artifact parameter
+  local _artifact
+  _artifact=$(_pkglib.get_arg_maybe artifact "$@")
+  
+  # If _name contains slashes (full module path), artifact is required
+  if [[ "$_name" == *"/"* ]]; then
+    [[ -z "$_artifact" ]] && { _error "--artifact required for full module paths: $_name"; return $_E_USG; }
+  fi
+  
+  # Extract dest if provided to show warning
+  local _dest
+  _dest=$(_pkglib.get_arg_maybe dest "$@")
+  
+  # Warn if dest is set - go installs to $GOBIN or $GOPATH/bin by default
+  [[ -n "$_dest" && "$_dest" != "default" ]] && _warn "go ignores --dest parameter, installs to \$GOBIN or \$GOPATH/bin (default: ~/go/bin)"
+  
+  return 0
+}
+
+##@ go command execution with kwargs handling
+##: pkglib.go.execute <action> <name> [kwargs...] -> pkglib.go.execute install "golang.org/x/tools/cmd/goimports@latest" --artifact=goimports
+pkglib.go.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _command _append_kwargs=true  # go supports build flags like -v, -a, -x
+  
+  # Use source directly from first parameter (module path)
+  local _source="$_name"
+  
+  # Extract artifact (binary name) using helper
+  local _binary_name
+  _binary_name=$(_pkglib.go.get_binary_name "$_source" "$@") || return $?
+  
+  # Map pkglib actions to go commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="install" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="install" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="install" ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall" ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  # Execute go command with or without kwargs
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  if [[ "$_command" == "uninstall" ]]; then
+    # Go uninstall is manual - remove the binary (needs artifact/binary name)
+    local _gobin="${GOBIN:-$(go env GOPATH)/bin}"
+    local _binary_path="$_gobin/$_binary_name"
+
+    [[ ! -f "$_binary_path" ]] && { _error "go binary not found: $_binary_path"; return $_E_NF; }
+
+    _debug "rm -f $_binary_path"
+    rm -f "$_binary_path" || { _error "go uninstall failed: $_name"; return $_E; }
+  else
+    # Handle force mode for install operations (needs artifact/binary name for cleanup)
+    if [[ "$_action" == "$_PKGLIB_ACTION_REINSTALL" || "$_action" == "$_PKGLIB_ACTION_UPDATE" || "$_action" == "$_PKGLIB_ACTION_REUPDATE" ]]; then
+      # Force reinstall by removing first, then installing
+      local _gobin="${GOBIN:-$(go env GOPATH)/bin}"
+      [[ -f "$_gobin/$_binary_name" ]] && rm -f "$_gobin/$_binary_name"
+    fi
+
+    # Install using source (module path) with optional kwargs
+    if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+      _debug "go $_command ${_filtered_kwargs[@]} $_source"
+      go "$_command" "${_filtered_kwargs[@]}" "$_source" || { _error "go $_command failed: $_name"; return $_E; }
+    else
+      _debug "go $_command $_source"
+      go "$_command" "$_source" || { _error "go $_command failed: $_name"; return $_E; }
+    fi
+  fi
+  
+  return 0
+}
+
+##@ go installation
+##: pkglib.go.install <name> <force> [--key=value...] -> pkglib.go.install "golang.org/x/tools/cmd/goimports@latest" true --artifact=goimports --source=golang.org/x/tools/cmd/goimports@latest
+pkglib.go.install() {
+  pkglib.common.install "go" "$@"
+}
+
+##@ go update (reinstall)
+##: pkglib.go.update <name> <force> [--key=value...] -> pkglib.go.update "golang.org/x/tools/cmd/goimports@latest" true --artifact=goimports --source=golang.org/x/tools/cmd/goimports@latest
+pkglib.go.update() {
+  pkglib.common.update "go" "$@"
+}
+
+##@ go uninstallation
+##: pkglib.go.uninstall <name> <force> [--key=value...] -> pkglib.go.uninstall "golang.org/x/tools/cmd/goimports@latest" false --artifact=goimports --source=golang.org/x/tools/cmd/goimports@latest
+pkglib.go.uninstall() {
+  pkglib.common.uninstall "go" "$@"
+}
+
+##@ go status
+##: pkglib.go.status <name> <force> [--key=value...] -> status=$(pkglib.go.status "golang.org/x/tools/cmd/goimports@latest" false --artifact=goimports)
+pkglib.go.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "go" || return $_E_DEP
+  shift 2
+  
+  # Extract binary name using helper
+  local _binary_name
+  _binary_name=$(_pkglib.go.get_binary_name "$_name" "$@") || return $?
+  
+  local _gobin="${GOBIN:-$(go env GOPATH)/bin}"
+  
+  [[ -f "$_gobin/$_binary_name" ]] && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] go
+
+##[ pipx
+##@ Validate pipx package parameters before installation
+##: pkglib.pipx.validate <source> <force> [kwargs...] -> pkglib.pipx.validate "black" "false" "--dest=/some/path"
+pkglib.pipx.validate() {
+  local _name="$1" _force="$2"  # _name is Python package name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract dest if provided to show warning
+  local _dest
+  _dest=$(_pkglib.get_arg_maybe dest "$@")
+  
+  # Warn if dest is set - pipx installs to $PIPX_BIN_DIR by default
+  [[ -n "$_dest" && "$_dest" != "default" ]] && _warn "pipx ignores --dest parameter, installs to \$PIPX_BIN_DIR (default: ~/.local/bin)"
+  
+  return 0
+}
+
+##@ pipx command execution with kwargs handling
+##: pkglib.pipx.execute <action> <name> [kwargs...] -> pkglib.pipx.execute install black
+pkglib.pipx.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _command _append_kwargs=false  # pipx has limited kwargs support
+  
+  # Use source directly from first parameter (package name)
+  local _source="$_name"
+  
+  # Map pkglib actions to pipx commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install"; _append_kwargs=true ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="install --force"; _append_kwargs=true ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="upgrade"; _append_kwargs=false ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="install --force"; _append_kwargs=true ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall"; _append_kwargs=false ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  # Execute pipx command with or without kwargs
+  # Filter out pkgman-specific parameters
+  local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+  _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
+
+  if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+    _debug "pipx $_command $_source ${_filtered_kwargs[@]}"
+    pipx $_command "$_source" "${_filtered_kwargs[@]}" || { _error "pipx $_command failed: $_name"; return $_E; }
+  else
+    _debug "pipx $_command $_source"
+    pipx $_command "$_source" || { _error "pipx $_command failed: $_name"; return $_E; }
+  fi
+  
+  return 0
+}
+
+##@ pipx installation
+##: pkglib.pipx.install <name> <force> [--key=value...] -> pkglib.pipx.install black true --index-url=https://pypi.org/simple
+pkglib.pipx.install() {
+  pkglib.common.install "pipx" "$@"
+}
+
+##@ pipx update (upgrade or reinstall with force)
+##: pkglib.pipx.update <name> <force> [--key=value...] -> pkglib.pipx.update black true
+pkglib.pipx.update() {
+  pkglib.common.update "pipx" "$@"
+}
+
+##@ pipx uninstallation
+##: pkglib.pipx.uninstall <name> <force> [--key=value...] -> pkglib.pipx.uninstall black false
+pkglib.pipx.uninstall() {
+  pkglib.common.uninstall "pipx" "$@"
+}
+
+##@ pipx status
+##: pkglib.pipx.status <name> <force> [--key=value...] -> status=$(pkglib.pipx.status black false)
+pkglib.pipx.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "pipx" || return $_E_DEP
+  
+  # Action - status checking doesn't need kwargs (pkgman passes package name as _name)
+  pipx list --short | grep -q "^$_name " && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+##] pipx
+
+##[ npm
+##@ Validate npm package parameters before installation
+##: pkglib.npm.validate <name> <force> [kwargs...] -> pkglib.npm.validate "prettier" "false"
+pkglib.npm.validate() {
+  local _name="$1" _force="$2"  # _name is npm package name
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract npx parameter to validate dependencies
+  local _npx
+  _npx=$(_pkglib.get_arg_opt npx "false" "$@")
+  
+  # Validate npm is available
+  _pkglib.require_tool "npm" || return $_E_DEP
+  # Validate npx is available if needed
+  [[ "$_npx" == "true" ]] && { _pkglib.require_tool "npx" || return $_E_DEP; }
+
+  return 0
+}
+
+##@ npm command execution with kwargs handling
+##: pkglib.npm.execute <action> <name> [kwargs...] -> pkglib.npm.execute install prettier --version=3.0.0
+pkglib.npm.execute() {
+  local _action="$1" _name="$2"
+  _pkglib.require_params "action" "$_action" "package-name" "$_name" || return $?
+  shift 2
+  
+  local _kwargs=("$@")
+  local _command _append_kwargs=false  # npm doesn't use our standard kwargs pattern
+  
+  # Use source directly from first parameter (npm package name)
+  local _source="$_name"
+  
+  # Extract parameters
+  local _version _npx
+  _version=$(_pkglib.get_arg_maybe version "$@")
+  _npx=$(_pkglib.get_arg_opt npx "false" "$@")
+  
+  # Map pkglib actions to npm commands
+  case "$_action" in
+    "$_PKGLIB_ACTION_INSTALL")    _command="install" ;;
+    "$_PKGLIB_ACTION_REINSTALL")  _command="install" ;;
+    "$_PKGLIB_ACTION_UPDATE")     _command="update" ;;
+    "$_PKGLIB_ACTION_REUPDATE")   _command="install" ;;
+    "$_PKGLIB_ACTION_UNINSTALL")  _command="uninstall" ;;
+    *) _error "unsupported action: $_action"; return $_E_USG ;;
+  esac
+  
+  if [[ "$_npx" == "true" ]]; then
+    # npx execution mode - validate tool works
+    case "$_action" in
+      "$_PKGLIB_ACTION_INSTALL"|"$_PKGLIB_ACTION_REINSTALL")
+        _debug "npx --yes $_source --version"
+        npx --yes "$_source" --version &>/dev/null || { _error "npx validation failed: $_name"; return $_E; }
+        ;;
+      "$_PKGLIB_ACTION_UPDATE"|"$_PKGLIB_ACTION_REUPDATE")
+        _debug "npx --yes $_source --version (update)"
+        npx --yes "$_source" --version &>/dev/null || { _error "npx validation failed: $_name"; return $_E; }
+        ;;
+      "$_PKGLIB_ACTION_UNINSTALL")
+        # For npx mode, uninstall clears npm cache
+        _debug "npm cache clean --force"
+        npm cache clean --force || { _error "npm cache clean failed: $_name"; return $_E; }
+        ;;
+    esac
+  else
+    # Default: Global installation mode
+    local _package="$_source"
+    [[ -n "$_version" ]] && _package="$_source@$_version"
+    
+    # Filter out npm-specific parameters and get clean kwargs for npm
+    local _filtered_kwargs
+    # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
+    _filtered_kwargs=($(_pkglib.filter_kwargs --npx --version "$@"))
+
+    # Execute npm command with filtered arguments
+    if [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+      _debug "npm $_command -g $_package ${_filtered_kwargs[@]}"
+      npm "$_command" "-g" "$_package" "${_filtered_kwargs[@]}" || { _error "npm $_command failed: $_name"; return $_E; }
+    else
+      _debug "npm $_command -g $_package"
+      npm "$_command" "-g" "$_package" || { _error "npm $_command failed: $_name"; return $_E; }
+    fi
+  fi
+  
+  return 0
+}
+
+##@ npm installation
+##: pkglib.npm.install <name> <force> [--key=value...] -> pkglib.npm.install prettier true --registry=https://npm.pkg.github.com --version=3.0.0
+pkglib.npm.install() {
+  pkglib.common.install "npm" "$@"
+}
+
+##@ npm update (upgrade or reinstall with force)
+##: pkglib.npm.update <name> <force> [--key=value...] -> pkglib.npm.update prettier true --version=3.0.0
+pkglib.npm.update() {
+  pkglib.common.update "npm" "$@"
+}
+
+##@ npm uninstallation
+##: pkglib.npm.uninstall <name> <force> [--key=value...] -> pkglib.npm.uninstall prettier false
+pkglib.npm.uninstall() {
+  pkglib.common.uninstall "npm" "$@"
+}
+
+##@ npm status
+##: pkglib.npm.status <name> <force> [--key=value...] -> status=$(pkglib.npm.status prettier false --npx=true)
+pkglib.npm.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  _pkglib.require_tool "npm" || return $_E_DEP
+  shift 2
+  
+  local _npx
+  _npx=$(_pkglib.get_arg_opt npx "false" "$@")
+  
+  if [[ "$_npx" == "true" ]]; then
+    # Check npx availability
+    npx --yes "$_name" --version &>/dev/null && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  else
+    # Check global installation
+    npm list -g --depth=0 "$_name" &>/dev/null && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  fi
+  
+  return 0
+}
+##] npm
+
+##[ github
+##@ Validate github package parameters before installation
+##: pkglib.github.validate <name> <force> [kwargs...] -> pkglib.github.validate "obsidianmd/obsidian-releases" "false" "--dest=/Applications" "--artifact=Obsidian.app"
+pkglib.github.validate() {
+  local _name="$1" _force="$2"  # _name is GitHub repo (owner/repo)
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract required parameters from kwargs
+  local _dest _artifact
+  _dest=$(_pkglib.get_arg_rqd dest "$@") || return $?
+  _artifact=$(_pkglib.get_arg_rqd artifact "$@") || return $?
+  
+  # Validate source format
+  _pkglib.validate_github_repo "$_name" || return $?
+  
+  # Validate destination directory
+  [[ ! -d "$_dest" ]] && { _warn "destination directory does not exist: $_dest (will be created during installation)"; }
+  
+  return 0
+}
+
+##@ Validate GitHub repository format (owner/repo)
+##: _pkglib.validate_github_repo <repo> -> _pkglib.validate_github_repo "owner/repo"
+_pkglib.validate_github_repo() {
+  local _repo="$1"
+  [[ -z "$_repo" ]] && { _error "repository required"; return $_E_USG; }
+  
+  # Check format: owner/repo (no spaces, slashes only as separator)
+  if [[ ! "$_repo" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+    _error "invalid repository format: '$_repo' (expected: owner/repo)"
+    return $_E_USG
+  fi
+  
+  # Ensure no multiple slashes
+  if [[ "$_repo" == *"//"* || "$_repo" == *"/"*"/"* ]]; then
+    _error "invalid repository format: '$_repo' (contains multiple slashes)"
+    return $_E_USG
+  fi
+}
+
+##@ Internal helper: Fetch GitHub release download URL
+##: _pkglib.github.get_download_url <repo> <selector> -> outputs download URL
+_pkglib.github.get_download_url() {
+  local _repo="$1" _selector="$2"
+  _pkglib.require_params "repo" "$_repo" "selector" "$_selector" || return $?
+  
+  _log "fetching github release: $_repo"
+  
+  # Get latest release info
+  local _api_url="$_PKGLIB_GITHUB_API_BASE/repos/$_repo/releases/latest"
+  local _release_data
+  _release_data=$(curl -s "$_api_url") || { _error "github API request failed: $_repo"; return $_E; }
+  
+  # Extract download URL matching selector pattern
+  local _download_url
+  local _regex_pattern
+  _regex_pattern=$(_pkglib.convert_glob_to_regex "$_selector")
+  
+  _download_url=$(echo "$_release_data" | grep "\"browser_download_url\"" | grep "$_regex_pattern" | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' | head -1)
+  
+  [[ -z "$_download_url" ]] && { _error "github asset not found: selector '$_selector' in $_repo"; return $_E; }
+  
+  _log "found github asset: $_download_url"
+  echo "$_download_url"
+}
+
+##@ Internal helper: Core download handling for both GitHub and Download managers
+##: _pkglib.download.core <url> <dest> <selector> <checksum> <artifact> <extract> <exec> <force> -> unified download handling
+_pkglib.download.core() {
+  local _url="$1" _dest="$2" _selector="$3" _checksum="$4" _artifact="$5" _extract="$6" _exec="$7" _force="$8"
+  
+  _log "downloading $_url to $_dest (extract: $_extract, force: $_force)"
+  
+  # Build loam.smart-download arguments
+  local _args=()
+  
+  # Handle extraction
+  [[ "$_extract" == "true" ]] && _args+=(-e)
+  # Add optional parameters
+  [[ -n "$_selector" ]] && _args+=(-s "$_selector")
+  [[ -n "$_checksum" ]] && _args+=(-c "$_checksum")
+  [[ "$_exec" == "true" ]] && _args+=(-x "$_artifact")
+  [[ "$_force" == "true" ]] && _args+=(-f)
+  
+  # Execute download
+  if [[ ${#_args[@]} -gt 0 ]]; then
+    _debug "loam.smart-download args: [${_args[*]}] url: $_url dest: $_dest"
+    loam.smart-download "${_args[@]}" "$_url" "$_dest" || { _error "download failed: $_url"; return $_E; }
+  else
+    _debug "loam.smart-download (no flags) url: $_url dest: $_dest"
+    loam.smart-download "$_url" "$_dest" || { _error "download failed: $_url"; return $_E; }
+  fi
+  
+  return 0
+}
+
+##@ github installation - resolves GitHub URL then delegates to download
+##: pkglib.github.install <name> <force> [--key=value...] -> pkglib.github.install obsidian true --source="obsidianmd/obsidian-releases" --selector="*.dmg" --dest=/Applications --artifact=Obsidian.app
+pkglib.github.install() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 2
+  
+  # Use source directly from first parameter (GitHub repo)
+  local _source="$_name" _selector
+  _selector=$(_pkglib.get_arg_opt selector "*" "$@")
+  
+  # Validate GitHub repository format
+  _pkglib.validate_github_repo "$_source" || return $?
+  
+  # Resolve GitHub release URL
+  local _download_url
+  _download_url=$(_pkglib.github.get_download_url "$_source" "$_selector") || return $?
+  
+  # Build new kwargs array with resolved URL and github defaults
+  local _download_kwargs=()
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      --source=*|--selector=*) 
+        # Skip original github-specific parameters
+        ;;
+      *)
+        # Keep all other arguments
+        _download_kwargs+=("$_arg")
+        ;;
+    esac
+  done
+  
+  # Add resolved URL as source and default extract=true
+  _download_kwargs+=("--source=$_download_url" "--extract=true")
+  
+  # Delegate to download manager with resolved URL as first parameter
+  pkglib.download.install "$_download_url" "$_force" "${_download_kwargs[@]}"
+}
+
+##@ github update - uninstall + install
+##: pkglib.github.update <name> <force> [--key=value...] -> pkglib.github.update obsidian true --source="obsidianmd/obsidian-releases" --selector="*.dmg" --dest=/Applications
+pkglib.github.update() {
+  pkglib.github.uninstall "$@" && pkglib.github.install "$@"
+}
+
+##@ github uninstallation - delegates directly to download
+##: pkglib.github.uninstall <name> <force> [--key=value...] -> pkglib.github.uninstall obsidian false --dest=/Applications --artifact=Obsidian.app
+pkglib.github.uninstall() {
+  pkglib.download.uninstall "$@"
+}
+
+##@ github status - delegates directly to download
+##: pkglib.github.status <name> <force> [--key=value...] -> status=$(pkglib.github.status obsidian false --dest=/Applications --artifact=Obsidian.app)
+pkglib.github.status() {
+  pkglib.download.status "$@"
+}
+##] github
+
+##( dmg
+##@ dmg validation - mac-only, delegates to download
+##: pkglib.dmg.validate <name> <force> [kwargs...] -> pkglib.dmg.validate "https://example.com/app.dmg" "false" "--dest=/Applications" "--artifact=App.app"
+pkglib.dmg.validate() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+
+  # Extract OS parameter if provided
+  local _os
+  _os=$(_pkglib.get_arg_maybe os "$@")
+
+  # DMG is macOS only - check OS compatibility
+  [[ -n "$_os" && "$_os" == "linux" ]] && { _error "dmg packages cannot be installed on Linux"; return $_E_OS; }
+
+  # Delegate to download validation
+  pkglib.download.validate "$_name" "$_force" "$@"
+}
+
+##@ dmg installation - delegates to download with type=dmg
+##: pkglib.dmg.install <name> <force> [--key=value...] -> pkglib.dmg.install "https://example.com/app.dmg" true --dest=/Applications --artifact=App.app
+pkglib.dmg.install() {
+  pkglib.download.install "$@" --type=dmg
+}
+
+##@ dmg update - uninstall + install
+##: pkglib.dmg.update <name> <force> [--key=value...] -> pkglib.dmg.update "https://example.com/app.dmg" true --dest=/Applications --artifact=App.app
+pkglib.dmg.update() {
+  pkglib.dmg.uninstall "$@" && pkglib.dmg.install "$@"
+}
+
+##@ dmg uninstallation - delegates to download
+##: pkglib.dmg.uninstall <name> <force> [--key=value...] -> pkglib.dmg.uninstall "https://example.com/app.dmg" false --dest=/Applications --artifact=App.app
+pkglib.dmg.uninstall() {
+  pkglib.download.uninstall "$@"
+}
+
+##@ dmg status - delegates to download
+##: pkglib.dmg.status <name> <force> [--key=value...] -> status=$(pkglib.dmg.status "https://example.com/app.dmg" false --dest=/Applications --artifact=App.app)
+pkglib.dmg.status() {
+  pkglib.download.status "$@"
+}
+##) dmg
+
+##[ download
+##@ Validate download package parameters before installation
+##: pkglib.download.validate <name> <force> [kwargs...] -> pkglib.download.validate "https://raw.../zap-sh" "false" "--dest=/usr/local/bin" "--artifact=zap-sh"
+pkglib.download.validate() {
+  local _name="$1" _force="$2"  # _name is download URL
+  _pkglib.require_params "package-name" "$_name" || return $?
+  shift 2
+  
+  # Extract required parameters from kwargs
+  local _dest _artifact
+  _dest=$(_pkglib.get_arg_rqd dest "$@") || return $?
+  _artifact=$(_pkglib.get_arg_rqd artifact "$@") || return $?
+  
+  # Validate source URL format
+  _pkglib.validate_url "$_name" || return $?
+  
+  # Validate destination directory
+  [[ ! -d "$_dest" ]] && { _warn "destination directory does not exist: $_dest (will be created during installation)"; }
+  
+  return 0
+}
+
+##@ download installation
+##: pkglib.download.install <name> <force> [--key=value...] -> pkglib.download.install zap-sh true --source="https://raw.../zap-sh" --dest=/shed/core/bin --extract=false --exec=true --artifact=zap-sh
+pkglib.download.install() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 2
+  
+  # Use source directly from first parameter (URL)
+  local _source="$_name" _dest _selector _checksum _artifact _extract
+  _dest=$(_pkglib.get_arg_opt dest "." "$@")
+  _selector=$(_pkglib.get_arg_maybe selector "$@")
+  _checksum=$(_pkglib.get_arg_maybe checksum "$@")
+  _artifact=$(_pkglib.get_arg_maybe artifact "$@")
+  _extract=$(_pkglib.get_arg_opt extract "false" "$@")
+  _exec=$(_pkglib.get_arg_opt exec "false" "$@")
+  
+  # Validate
+  _pkglib.validate_url "$_source" || return $?
+  
+  # Action
+  _log "installing package - download: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+  
+  # Use unified core download handler
+  _pkglib.download.core "$_source" "$_dest" "$_selector" "$_checksum" "$_artifact" "$_extract" "$_exec" "$_force" || return $?
+  
+  _log "✓ download package installed: $_name"
+  return 0
+}
+
+##@ download update - uninstall + install
+##: pkglib.download.update <name> <force> [--key=value...] -> pkglib.download.update zap-sh true --source="https://raw.../zap-sh" --dest=/shed/core/bin --extract=false --exec=true --artifact=zap-sh
+pkglib.download.update() {
+  pkglib.download.uninstall "$@" && pkglib.download.install "$@"
+}
+
+##@ download uninstallation
+##: pkglib.download.uninstall <name> <force> [--key=value...] -> pkglib.download.uninstall zap-sh false --dest=/shed/core/bin --artifact=zap-sh
+pkglib.download.uninstall() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 2
+  
+  # Extract
+  local _dest _artifact
+  _dest=$(_pkglib.get_arg_opt dest "." "$@")
+  _artifact=$(_pkglib.get_arg_rqd artifact "$@") || return $?
+  
+  # Action
+  _log "uninstalling package - download: $_name (force: $_force) with args: [$(_pkglib.get_args_display "$@")]"
+  
+  # Use explicit artifact (exact match only)
+  local _target="$_dest/$_artifact"
+  
+  [[ -f "$_target" ]] || [[ -d "$_target" ]] || { _warn "file not found: $_target"; return $_E_NF; }
+  
+  # Use loam.trash for safe removal
+  loam.trash "$_target" || { _error "failed to move to trash: $_target"; return $_E; }
+  _log "✓ download package uninstalled: $_name"
+  return 0
+}
+
+##@ download status
+##: pkglib.download.status <name> <force> [--key=value...] -> status=$(pkglib.download.status zap-sh false --dest=/shed/core/bin --artifact=zap-sh)
+pkglib.download.status() {
+  local _name="$1" _force="$2"
+  _pkglib.require_params "package-name" "$_name" "force-flag" "$_force" || return $?
+  shift 2
+  
+  # Extract
+  local _dest _artifact
+  _dest=$(_pkglib.get_arg_opt dest "." "$@")
+  _artifact=$(_pkglib.get_arg_maybe artifact "$@")
+  
+  # Action
+  # Determine target path - use artifact if provided, otherwise use name
+  local _target=""
+  if [[ -n "$_artifact" ]]; then
+    _target="$_dest/$_artifact"
+  else
+    _target="$_dest/$_name"
+  fi
+
+  if [[ -f "$_target" || -d "$_target" ]]; then
+    echo "$_PKGLIB_STATUS_INSTALLED"
+  else
+    echo "$_PKGLIB_STATUS_MISSING"
+  fi
+  return 0
+}
+##] download
+
+##[ script
+##@ Validate script package parameters before installation
+##: pkglib.script.validate <name> <force> [kwargs...] -> pkglib.script.validate "pkgboot" "false" --artifact=cargo
+pkglib.script.validate() {
+  local _name="$1" _force="$2"  # _name is source path (could be relative like "pkgboot")
+  _pkglib.require_params "source-path" "$_name" || return $?
+  
+  # Resolve the source path (handles both absolute paths and relative resolution)
+  local _resolved_path
+  _resolved_path=$(_pkglib.resolve_source_path "$_name") || return $?
+  
+  # Validate resolved script is executable
+  _pkglib.ensure_executable "$_resolved_path" || return $?
+  return 0
+}
+
+##@ script command execution with kwargs handling
+##: pkglib.script.execute <action> <name> <force> [kwargs...] -> pkglib.script.execute install "pkgboot" "true" --artifact=cargo-manager
+pkglib.script.execute() {
+  local _action="$1" _name="$2" _force="$3"
+  _pkglib.require_params "action" "$_action" "source-path" "$_name" "force-flag" "$_force" || return $?
+  shift 3
+  
+  # Resolve the source path (handles both absolute paths and relative resolution)
+  local _resolved_source
+  _resolved_source=$(_pkglib.resolve_source_path "$_name") || return $?
+  
+  # Validate resolved script is executable
+  _pkglib.ensure_executable "$_resolved_source" || return $?
+  
+  # Action logging
+  _log "${_action}ing package - script: $_name with args: [$(_pkglib.get_args_display "$@")]"
+  
+  # Build script arguments: action, force flag, plus all kwargs
+  local _exec_args=("$_action" "$_force")
+  _exec_args+=("$@")  # Pass all remaining kwargs to the script
+  
+  # Execute the resolved script with CLI arguments
+  # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
+  _debug "$_resolved_source ${_exec_args[@]}"
+  "$_resolved_source" "${_exec_args[@]}"
+  local _exit_code=$?
+  _debug "script exit code: $_exit_code"
+  return $_exit_code
+}
+
+##@ script installation
+##: pkglib.script.install <name> <force> [--key=value...] -> pkglib.script.install myapp true --source=/path/to/script.sh --dest=/usr/local/bin --artifact=myapp-cli
+pkglib.script.install() {
+  local _name="$1" _force="$2" _exit_code
+  shift 2  # Remove name and force, keep only kwargs
+  if pkglib.script.execute "$_PKGLIB_ACTION_INSTALL" "$_name" "$_force" "$@"; then
+    _log "✓ script installed: $_name"
+    return 0
+  else
+    _exit_code=$?
+    _error "script installation failed: $_name"
+    return $_exit_code
+  fi
+}
+
+##@ script update
+##: pkglib.script.update <name> <force> [--key=value...] -> pkglib.script.update myapp true --source=/path/to/script.sh --dest=/usr/local/bin --artifact=myapp-cli
+pkglib.script.update() {
+  local _name="$1" _force="$2" _exit_code
+  shift 2  # Remove name and force, keep only kwargs
+  if pkglib.script.execute "$_PKGLIB_ACTION_UPDATE" "$_name" "$_force" "$@"; then
+    _log "✓ script updated: $_name"
+    return 0
+  else
+    _exit_code=$?
+    _error "script update failed: $_name"
+    return $_exit_code
+  fi
+}
+
+##@ script uninstallation
+##: pkglib.script.uninstall <name> <force> [--key=value...] -> pkglib.script.uninstall myapp false --source=/path/to/script.sh --dest=/usr/local/bin --artifact=myapp-cli
+pkglib.script.uninstall() {
+  local _name="$1" _force="$2" _exit_code
+  shift 2  # Remove name and force, keep only kwargs
+  if pkglib.script.execute "$_PKGLIB_ACTION_UNINSTALL" "$_name" "$_force" "$@"; then
+    _log "✓ script uninstalled: $_name"
+    return 0
+  else
+    _exit_code=$?
+    _error "script uninstall failed: $_name"
+    return $_exit_code
+  fi
+}
+
+##@ script status
+##: pkglib.script.status <name> <force> [--key=value...] -> status=$(pkglib.script.status myapp false --source=/path/to/script.sh --dest=/usr/local/bin --artifact=myapp-cli)
+pkglib.script.status() {
+  local _name="$1" _force="$2"
+  shift 2  # Remove name and force, keep only kwargs
+  if pkglib.script.execute "status" "$_name" "$_force" "$@"; then
+    echo "$_PKGLIB_STATUS_INSTALLED"
+  else
+    echo "$_PKGLIB_STATUS_MISSING"
+  fi
+  return 0
+}
+##] script
+##) managers
