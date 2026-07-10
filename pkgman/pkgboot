@@ -1,2 +1,1338 @@
-#!/bin/bash
-# placeholder — replaced by pkgman-revive Tasks 2-4
+#!/usr/bin/env bash
+##( header
+# --------------------------------------------------------------------
+# pkgboot - Universal package manager bootstrap installer
+#
+# Provisions package managers and their dependencies using a combination
+# of manual installation (brew) and pkgman dogfooding for other managers.
+# Complies with pkgman script manager interface while supporting
+# independent execution with help and status capabilities.
+#
+# CALLING INTERFACES:
+# 1. Script Manager Interface (called by pkgman):
+#    pkgboot <action> <force> [--target=<manager-name>] [--dest=<path>] [--artifact=<name>]
+#    Example: pkgboot install true --target=cargo-manager --artifact=cargo
+#
+# 2. Independent Execution Interface:
+#    pkgboot [OPTIONS] <action> <manager>
+#    Example: pkgboot install cargo, pkgboot status mas, pkgboot help go
+#
+# MANAGER NAME MAPPING:
+# - Supports both direct names (cargo) and manager names (cargo-manager)
+# - Manager names with -manager suffix are mapped to internal logic
+# - Example: cargo-manager → cargo, mas-manager → mas, etc.
+# --------------------------------------------------------------------
+# AUTHOR: Budha <budhash@gmail.com>
+# VERSION: 1.0.0
+# LICENSE: MIT License
+# --------------------------------------------------------------------
+# __TEMPLATE__: https://github.com/budhash/zap-sh/blob/main/templates/basic.sh
+# __ID__: basic-1.0.0
+# --------------------------------------------------------------------
+##) header
+
+##( configuration
+set -eEuo pipefail; IFS=$'\n\t'  # fail fast, secure IFS
+##) configuration
+
+##( metadata
+readonly __SOURCE="${BASH_SOURCE[0]:-}"
+readonly __PIPED=$([[ -t 0 || -n "$__SOURCE" ]] && echo false || echo true)
+readonly __APP="$(basename "${__SOURCE:-$0}")"
+readonly __APPFILE="$__SOURCE"
+if [[ -n "$__SOURCE" ]]; then
+  readonly __APPDIR="$(s="$__SOURCE"; while [[ -h "$s" ]]; do
+    d="$(cd -P "$(dirname "$s")" && pwd)"; s="$(readlink "$s")"; [[ "$s" != /* ]] && s="$d/$s"; done; cd -P "$(dirname "$s")" && pwd)"
+else
+  readonly __APPDIR="$(pwd)"
+fi
+__DBG=${DEBUG:-false}
+##) metadata
+
+##( globals
+
+##[ colors
+_RST=$'\033[0m' _GRN=$'\033[0;32m' _YLW=$'\033[0;33m' _RED=$'\033[0;31m' _BLU=$'\033[0;34m'
+[[ -n "${NO_COLOR:-}" || ! -t 1 ]] && _RST='' _GRN='' _YLW='' _RED='' _BLU=''
+##] colors
+
+##[ error
+# general failure / bad usage / dependency not found / unsupported OS / not found / permission error / not connected / piped mode
+_E=1 _E_USG=2 _E_DEP=3 _E_OS=4 _E_NF=5 _E_NP=6 _E_NC=7 _E_PIPE=8
+##] error
+
+##) globals
+
+##( helpers
+
+##[ system
+u.os() { case "${OSTYPE:-}" in darwin*) echo mac;; linux*) echo linux;; *) echo unknown;; esac; }
+u.die() { u.error "$@"; exit $_E; }
+u.require() {
+  local tool="${1:-}"
+  [[ -z "$tool" ]] && { u.error "missing dependency name"; exit $_E_DEP; }
+  if [[ "$tool" == /* ]] || [[ "$tool" == ./* ]] || [[ "$tool" == ../* ]]; then
+    [[ -x "$tool" ]] || { u.error "missing dependency: $tool"; exit $_E_DEP; } # Absolute or relative path - test directly
+  else
+    command -v "$tool" >/dev/null || { u.error "missing dependency: $tool"; exit $_E_DEP; }
+  fi
+}
+##] system
+
+##[ logging
+u.log() {
+  local _l="info " _co="$_GRN"
+  [[ "${1:-}" == "-l" ]] && { _l="${2:-info}"; shift 2; }
+  case "$_l" in warn) _co="$_YLW";; error) _co="$_RED";; debug) _co="$_BLU"; [[ "$__DBG" != true ]] && return;; esac
+  printf "${_co}[%s]${_RST} %s\n" "$_l" "$*" >&2
+  return 0
+}
+u.info() { u.log -l "info " "$@"; }
+u.warn() { u.log -l "warn " "$@"; }
+u.error() { u.log -l "error" "$@"; }
+u.debug() { u.log -l "debug" "$@"; }
+##] logging
+
+##) helpers
+
+##( app
+
+##[ config
+readonly __NAME=pkgboot
+readonly __OS=(mac linux)
+readonly __APP_DEPS=(find)
+readonly __ALLOW_PIPED=false  # Bootstrap script should not run in piped mode
+##] config
+
+##[ constants
+# Supported managers and their bootstrap dependencies
+readonly PKGBOOT_MANAGERS=(brew apt dnf mas cargo go pipx npm download github script)
+
+# Status constants matching pkglib
+readonly PKGBOOT_STATUS_INSTALLED="installed"
+readonly PKGBOOT_STATUS_MISSING="missing"
+
+# Manager categories for bootstrap strategy
+readonly MANUAL_MANAGERS=(brew)  # Must be installed manually first
+readonly DOGFOOD_MANAGERS=(mas cargo go pipx npm)  # Use pkgman to install dependencies
+readonly UTILITY_MANAGERS=(download github script)  # Utility managers (no actual installation)
+##] constants
+
+##[ globals
+_PKGMAN_PATH=""
+##] globals
+
+##[ functions
+
+##@ Validate brew is available and return its prefix
+_require_brew() {
+  if ! command -v brew &>/dev/null; then
+    u.error "brew not found - install homebrew first"
+    return $_E_DEP
+  fi
+  brew --prefix
+}
+
+##@ Map manager names to internal logic (handles *-manager suffix)
+##: _map_manager_name <manager> -> internal_name=$(_map_manager_name "cargo-manager")
+_map_manager_name() {
+  local _manager="$1"
+  [[ -z "$_manager" ]] && { u.error "manager name required"; return $_E_USG; }
+  
+  # Strip -manager suffix if present
+  if [[ "$_manager" == *-manager ]]; then
+    echo "${_manager%-manager}"
+  else
+    echo "$_manager"
+  fi
+}
+
+##@ Execute pkgman command with global pkgman path, with error handling
+_pkgman_run() {
+  [[ -z "$_PKGMAN_PATH" ]] && { u.error "--pkgman parameter required for dogfooding"; return $_E_USG; }
+  [[ ! -x "$_PKGMAN_PATH" ]] && { u.error "pkgman not executable: $_PKGMAN_PATH"; return $_E_DEP; }
+  
+  u.debug "using pkgman: $_PKGMAN_PATH"
+  u.debug "running: $_PKGMAN_PATH $*"
+  
+  # Check if this is a dry-run (echo commands instead of executing)
+  if [[ "${PKGBOOT_DRY_RUN:-false}" == "true" ]]; then
+    echo "DRY-RUN: $_PKGMAN_PATH $*"
+  else
+    "$_PKGMAN_PATH" "$@"
+  fi
+}
+
+##@ Track package with pkgman (add if not tracked, then sync)
+##: _pkgman_track <manager> <package> <description> -> _pkgman_track brew mas "Mac App Store CLI"
+_pkgman_track() {
+  local _manager="$1" _package="$2" _description="$3"
+  [[ -z "$_manager" ]] && { u.error "manager required for _pkgman_track"; return $_E_USG; }
+  [[ -z "$_package" ]] && { u.error "package required for _pkgman_track"; return $_E_USG; }
+  [[ -z "$_description" ]] && { u.error "description required for _pkgman_track"; return $_E_USG; }
+  
+  # Check if already tracked
+  if _pkgman_run status "$_package" &>/dev/null; then
+    u.debug "$_package already tracked, syncing status"
+    _pkgman_run sync "$_package"
+  else
+    u.debug "tracking $_package via $_manager"
+    _pkgman_run add "$_manager" "$_package" --scope system --detail "$_description"
+    _pkgman_run sync "$_package"
+  fi
+}
+
+##@ Track and install package with pkgman (complete dogfooding flow)
+##: _pkgman_install <manager> <package> <description> -> _pkgman_install brew mas "Mac App Store CLI"
+_pkgman_install() {
+  local _manager="$1" _package="$2" _description="$3"
+  [[ -z "$_manager" ]] && { u.error "manager required for _pkgman_install"; return $_E_USG; }
+  [[ -z "$_package" ]] && { u.error "package required for _pkgman_install"; return $_E_USG; }
+  [[ -z "$_description" ]] && { u.error "description required for _pkgman_install"; return $_E_USG; }
+  
+  # Add to tracking if not already tracked
+  if ! _pkgman_run status "$_package" &>/dev/null; then
+    u.debug "tracking $_package via $_manager"
+    _pkgman_run add "$_manager" "$_package" --scope system --detail "$_description"
+  else
+    # If already tracked, sync status to detect external changes
+    u.debug "syncing $_package status to detect external changes"
+    _pkgman_run sync "$_package"
+  fi
+  
+  # Install the package (this will handle current status properly)
+  _pkgman_run install "$_package"
+}
+
+_main() {
+  # Handle both script manager interface and independent execution
+  if [[ $# -ge 2 && "$1" =~ ^(install|update|uninstall|status)$ && "$2" =~ ^(true|false)$ ]]; then
+    # Script manager interface: action force [--target=name] [--dest=...] [--artifact=...]
+    local _action="$1" _force="$2"
+    shift 2
+    
+    # Parse optional parameters for script manager mode
+    local _dest="." _artifact="" _target="" _pkgman_path=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --dest=*) _dest="${1#*=}"; shift ;;
+        --dest) _dest="$2"; shift 2 ;;
+        --artifact=*) _artifact="${1#*=}"; shift ;;
+        --artifact) _artifact="$2"; shift 2 ;;
+        --target=*) _target="${1#*=}"; shift ;;
+        --target) _target="$2"; shift 2 ;;
+        --pkgman=*) _pkgman_path="${1#*=}"; shift ;;
+        --pkgman) _pkgman_path="$2"; shift 2 ;;
+        *) u.warn "ignoring unknown parameter: $1"; shift ;;
+      esac
+    done
+    
+    # For script manager mode, target parameter is required
+    [[ -z "$_target" ]] && { u.error "script manager interface requires --target parameter"; exit $_E_USG; }
+    
+    # Set global pkgman path if provided
+    [[ -n "$_pkgman_path" ]] && _PKGMAN_PATH="$_pkgman_path"
+    
+    _pkgboot_dispatch "$_action" "$_target" "$_dest" "$_artifact" "$_force"
+  elif [[ $# -ge 1 && "$1" =~ ^(install|update|uninstall|status)$ ]]; then
+    # Legacy detection: action without force flag - treat as independent execution
+    _parse_independent_args "$@"
+  else
+    # Independent execution: pkgboot [options] [action] [manager]
+    _parse_independent_args "$@"
+  fi
+}
+
+##@ Parse arguments for independent execution
+_parse_independent_args() {
+  local _help=false _version=false _action="" _manager=""
+  local OPTIND=1
+  
+  while getopts "hv" _opt; do
+    case $_opt in
+      h) _help=true;;
+      v) _version=true;;
+      \?) u.error "unknown option: -${OPTARG:-}"; exit $_E_USG;;
+    esac
+  done
+  shift $((OPTIND-1))
+  
+  [[ "$_help" == true ]] && { _help; exit 0; }
+  [[ "$_version" == true ]] && { _version; exit 0; }
+  
+  _action="${1:-}"
+  _manager="${2:-}"
+  
+  if [[ -z "$_action" ]]; then
+    u.error "action required: install, update, uninstall, status, or help"
+    _help
+    exit $_E_USG
+  fi
+  
+  case "$_action" in
+    help)
+      if [[ -n "$_manager" ]]; then
+        _show_manager_help "$_manager"
+      else
+        _help
+      fi
+      ;;
+    install|update|uninstall|status)
+      [[ -z "$_manager" ]] && { u.error "manager required for $_action"; exit $_E_USG; }
+      _pkgboot_dispatch "$_action" "$_manager" "." "" "false"
+      ;;
+    *)
+      u.error "unknown action: $_action"
+      _help
+      exit $_E_USG
+      ;;
+  esac
+}
+
+##@ Dispatch to appropriate manager method
+_pkgboot_dispatch() {
+  local _action="$1" _manager="$2" _dest="${3:-.}" _artifact="${4:-}" _force="${5:-false}"
+  shift 5
+  
+  # Note: _PKGMAN_PATH is now set globally in _main function
+  
+  # Map manager name (handles *-manager suffix)
+  local _internal_manager
+  _internal_manager=$(_map_manager_name "$_manager") || u.die "failed to map manager name: $_manager"
+  
+  # Validate internal manager name
+  local _valid_manager=false _m
+  for _m in "${PKGBOOT_MANAGERS[@]:-}"; do
+    [[ "$_internal_manager" == "$_m" ]] && { _valid_manager=true; break; }
+  done
+  
+  [[ "$_valid_manager" != true ]] && { u.error "unsupported manager: $_manager (mapped to: $_internal_manager)"; return $_E_USG; }
+  
+  # Dispatch to manager-specific method using internal name
+  local _method="_pkgboot.${_internal_manager}.${_action}"
+  if declare -f "$_method" >/dev/null 2>&1; then
+    "$_method" "$_dest" "$_artifact" "$_force"
+  else
+    u.error "method not implemented: $_method"
+    return $_E_USG
+  fi
+}
+
+##] functions
+
+##[ brew
+##@ Install Xcode Command Line Tools dependency for brew
+_pkgboot.brew.install_system_tools() {
+  u.info "checking system development tools"
+  
+  # Check and install Xcode Command Line Tools
+  if ! xcode-select -p &>/dev/null; then
+    u.info "installing Xcode Command Line Tools"
+    touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+    
+    # Find the Command Line Tools package 
+    local _prod=$(softwareupdate -l 2>/dev/null | grep '\*.*Command Line' | tail -n 1 | sed 's/^[^C]* //')
+    
+    if [[ -n "$_prod" ]]; then
+      u.info "installing: $_prod"
+      softwareupdate -i "$_prod" --verbose
+    else
+      u.warn "no Command Line Tools package found via softwareupdate"
+      u.info "attempting interactive installation"
+      xcode-select --install
+      u.info "please complete the Command Line Tools installation dialog and re-run provision"
+      return 1
+    fi
+    
+    rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+  else
+    u.debug "Xcode Command Line Tools already installed"
+  fi
+}
+
+##@ Install brew with full dependency chain
+_pkgboot.brew.install_brew() {
+  # No-op if already installed
+  if command -v brew &>/dev/null; then
+    u.debug "Homebrew already installed"
+    return 0
+  fi
+  
+  u.info "installing Homebrew package manager"
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  
+  # Add to PATH for current session
+  if [[ -x "/opt/homebrew/bin/brew" ]]; then
+    export PATH="/opt/homebrew/bin:$PATH"
+  elif [[ -x "/usr/local/bin/brew" ]]; then
+    export PATH="/usr/local/bin:$PATH"
+  fi
+}
+
+##@ Manual brew installation - foundation for dogfooding
+_pkgboot.brew.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "installing brew (manual bootstrap) - force: $_force"
+  
+  case "$(u.os)" in
+    mac)
+      if command -v brew &>/dev/null; then
+        if [[ "$_force" == "true" ]]; then
+          u.warn "brew already installed - force flag ignored (brew reinstall not supported)"
+        else
+          u.info "brew already installed"
+        fi
+        return 0
+      fi
+      
+      # Install system dependencies first
+      _pkgboot.brew.install_system_tools || return $?
+      
+      # Install brew
+      _pkgboot.brew.install_brew || return $?
+      ;;
+    linux)
+      u.info "brew not needed on Linux - skipping"
+      u.info "Linux systems should use native package managers: apt (Ubuntu/Debian), dnf (Fedora), yum (RHEL/CentOS)"
+      u.info "if you really need brew on Linux, install manually: https://brew.sh/"
+      return 0
+      ;;
+    *)
+      u.error "unsupported OS for brew: $(u.os)"
+      return $_E_OS
+      ;;
+  esac
+  
+  u.info "✓ brew installation completed"
+}
+
+_pkgboot.brew.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating brew"
+  
+  if ! command -v brew &>/dev/null; then
+    u.error "brew not installed - cannot update"
+    return $_E_NF
+  fi
+  
+  brew update
+  u.info "✓ brew updated"
+}
+
+_pkgboot.brew.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for brew - system dependency"
+  return $_E_USG
+}
+
+_pkgboot.brew.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  
+  # Brew is macOS-only, show as not applicable on Linux
+  case "$(u.os)" in
+    linux)
+      u.info "brew: not applicable (Linux)"
+      exit 0  # Consider it "installed" for provisioning purposes
+      ;;
+  esac
+  
+  if command -v brew &>/dev/null; then
+    u.info "brew: installed"
+    exit 0
+  else
+    u.info "brew: missing"
+    exit 1
+  fi
+}
+##] brew
+
+##[ apt
+##@ APT is typically pre-installed on Debian/Ubuntu systems
+_pkgboot.apt.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "checking apt availability"
+  
+  # APT is Linux-only, skip on macOS
+  case "$(u.os)" in
+    mac)
+      u.info "apt not needed on macOS - skipping"
+      return 0
+      ;;
+  esac
+  
+  if command -v apt &>/dev/null; then
+    u.info "apt already available"
+    return 0
+  fi
+  
+  u.error "apt not available - install via system package manager"
+  return $_E_NF
+}
+
+_pkgboot.apt.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating apt package lists"
+  
+  if ! command -v apt &>/dev/null; then
+    u.error "apt not available"
+    return $_E_NF
+  fi
+  
+  sudo apt update
+  u.info "✓ apt updated"
+}
+
+_pkgboot.apt.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for apt - system dependency"
+  return $_E_USG
+}
+
+_pkgboot.apt.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  
+  # APT is Linux-only, show as not applicable on macOS
+  case "$(u.os)" in
+    mac)
+      u.info "apt: not applicable (macOS)"
+      exit 0  # Consider it "installed" for provisioning purposes
+      ;;
+  esac
+  
+  if command -v apt &>/dev/null; then
+    u.info "apt: installed"
+    exit 0
+  else
+    u.info "apt: missing"
+    exit 1
+  fi
+}
+##] apt
+
+##[ dnf
+##@ DNF is typically pre-installed on Red Hat/Fedora systems
+_pkgboot.dnf.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "checking dnf availability"
+  
+  # DNF is Linux-only, skip on macOS
+  case "$(u.os)" in
+    mac)
+      u.info "dnf not needed on macOS - skipping"
+      return 0
+      ;;
+  esac
+  
+  if command -v dnf &>/dev/null; then
+    u.info "dnf already available"
+    return 0
+  fi
+  
+  u.error "dnf not available - install via system package manager"
+  return $_E_NF
+}
+
+_pkgboot.dnf.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating dnf package metadata"
+  
+  if ! command -v dnf &>/dev/null; then
+    u.error "dnf not available"
+    return $_E_NF
+  fi
+  
+  sudo dnf check-update
+  u.info "✓ dnf updated"
+}
+
+_pkgboot.dnf.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for dnf - system dependency"
+  return $_E_USG
+}
+
+_pkgboot.dnf.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  
+  # DNF is Linux-only, show as not applicable on macOS
+  case "$(u.os)" in
+    mac)
+      u.info "dnf: not applicable (macOS)"
+      exit 0  # Consider it "installed" for provisioning purposes
+      ;;
+  esac
+  
+  if command -v dnf &>/dev/null; then
+    u.info "dnf: installed"
+    exit 0
+  else
+    u.info "dnf: missing"
+    exit 1
+  fi
+}
+##] dnf
+
+##[ mas
+##@ Mac App Store CLI - use pkgman dogfooding
+_pkgboot.mas.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "installing mas via pkgman dogfooding"
+  
+  case "$(u.os)" in
+    mac)
+      # Check if mas is already installed
+      if command -v mas &>/dev/null && [[ "$_force" != "true" ]]; then
+        u.info "mas already installed - adding to pkgman tracking"
+        _pkgman_track brew mas "[internal] mac app store cli"
+        return 0
+      fi
+      
+      # Validate brew is available for mas installation
+      _require_brew >/dev/null || return $?
+      
+      _pkgman_install brew mas "[internal] mac app store cli"
+      ;;
+    *)
+      u.info "mas not needed on Linux - skipping"
+      return 0
+      ;;
+  esac
+  
+  u.info "✓ mas installation completed"
+}
+
+_pkgboot.mas.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating mas via pkgman"
+  _pkgman_run update mas
+}
+
+_pkgboot.mas.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for mas - prevents deprovisioning"
+  return $_E_USG
+}
+
+_pkgboot.mas.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  
+  # MAS is macOS-only, show as not applicable on Linux
+  case "$(u.os)" in
+    linux)
+      u.info "mas: not applicable (Linux)"
+      exit 0  # Consider it "installed" for provisioning purposes
+      ;;
+  esac
+  
+  if command -v mas &>/dev/null; then
+    u.info "mas: installed"
+    exit 0
+  else
+    u.info "mas: missing"
+    exit 1
+  fi
+}
+##] mas
+
+##[ cargo
+##@ Rust package manager - use pkgman dogfooding
+_pkgboot.cargo.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "installing cargo via pkgman dogfooding"
+  
+  # Check if cargo is already installed
+  if command -v cargo &>/dev/null && [[ "$_force" != "true" ]]; then
+    u.info "cargo already installed - adding to pkgman tracking"
+    _pkgman_track brew rustup "[internal] rust toolchain installer with cargo"
+    return 0
+  fi
+  
+  # Validate brew is available for rustup installation
+  _require_brew >/dev/null || return $?
+  
+  # Install Rust which includes cargo
+  _pkgman_install brew rustup "[internal] rust toolchain installer with cargo"
+  
+  # Initialize rustup with stable toolchain (no PATH modification)
+  u.info "initializing rustup with stable toolchain"
+  if ! command -v cargo &>/dev/null; then
+    u.info "running rustup-init to initialize Rust toolchain"
+    rustup-init -y --no-modify-path || { u.error "rustup-init failed"; return $_E; }
+  else
+    u.info "cargo already available"
+  fi
+  
+  u.info "add to PATH: export PATH=\"\${CARGO_HOME:-\$HOME/.cargo}/bin:\$PATH\""
+  u.info "Rust environment variables (can be customized):"
+  u.info "  ZSH_SDK_HOME (default: \$HOME) - base directory for SDKs"
+  u.info "  RUSTUP_HOME (default: \$ZSH_SDK_HOME/.rustup) - rustup installation"
+  u.info "  CARGO_HOME (default: \$ZSH_SDK_HOME/.cargo) - cargo installation"
+  u.info "✓ cargo installation completed"
+}
+
+_pkgboot.cargo.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating cargo via pkgman"
+  _pkgman_run update rustup
+}
+
+_pkgboot.cargo.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for cargo - prevents deprovisioning"
+  return $_E_USG
+}
+
+_pkgboot.cargo.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  if command -v cargo &>/dev/null; then
+    u.info "cargo: installed"
+    exit 0
+  else
+    u.info "cargo: missing"
+    exit 1
+  fi
+}
+##] cargo
+
+##[ go
+##@ Go programming language - OS-specific installation methods
+_pkgboot.go.mac.install() {
+  # Check if go is already installed
+  if command -v go &>/dev/null && [[ "$_force" != "true" ]]; then
+    u.info "go already installed - adding to pkgman tracking"
+    _pkgman_track brew go "[internal] go programming language"
+    return 0
+  fi
+  
+  # Validate brew is available for go installation
+  _require_brew >/dev/null || return $?
+  
+  u.info "installing go on macOS via brew"
+  _pkgman_install brew go "[internal] go programming language"
+}
+
+_pkgboot.go.linux.install() {
+  u.info "installing go on Linux via system package manager"
+  if command -v apt &>/dev/null; then
+    _pkgman_install apt golang-go "[internal] go programming language"
+  elif command -v dnf &>/dev/null; then
+    _pkgman_install dnf golang "[internal] go programming language"
+  else
+    u.error "no supported package manager found for go installation"
+    return $_E_DEP
+  fi
+}
+
+_pkgboot.go.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "installing go via pkgman dogfooding"
+  
+  case "$(u.os)" in
+    mac) _pkgboot.go.mac.install ;;
+    linux) _pkgboot.go.linux.install ;;
+    *) u.error "unsupported OS for go: $(u.os)"; return $_E_OS ;;
+  esac
+  
+  # Configure Go to use shared binary directory
+  echo "mkdir -p \"\${ZSH_SDK_BIN:-\$HOME/.local/bin}\""
+  
+  u.info "✓ go installation completed"
+  u.info "Go environment variables (can be customized):"
+  u.info "  ZSH_SDK_HOME (default: \$HOME) - base directory for SDKs"
+  u.info "  ZSH_SDK_BIN (default: \$ZSH_SDK_HOME/.local/bin) - shared binary directory"
+  u.info "  GOPATH (default: \$ZSH_SDK_HOME/go) - workspace directory"
+  u.info "  GOBIN (default: \$ZSH_SDK_BIN) - installed binaries, must be in PATH"
+  u.info "Add to PATH: export PATH=\"\${ZSH_SDK_BIN:-\$HOME/.local/bin}:\$PATH\""
+}
+
+_pkgboot.go.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating go via pkgman"
+  
+  case "$(u.os)" in
+    mac) _pkgman_run update go ;;
+    linux) 
+      if command -v apt &>/dev/null; then
+        _pkgman_run update golang-go
+      elif command -v dnf &>/dev/null; then
+        _pkgman_run update golang
+      fi
+      ;;
+  esac
+}
+
+_pkgboot.go.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for go - prevents deprovisioning"
+  return $_E_USG
+}
+
+_pkgboot.go.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  if command -v go &>/dev/null; then
+    u.info "go: installed"
+    exit 0
+  else
+    u.info "go: missing"
+    exit 1
+  fi
+}
+##] go
+
+##[ pipx
+##@ Python application installer - use pkgman dogfooding
+_pkgboot.pipx.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "installing pipx via pkgman dogfooding"
+  
+  case "$(u.os)" in
+    mac)
+      # Check if pipx is already installed
+      if command -v pipx &>/dev/null && [[ "$_force" != "true" ]]; then
+        u.info "pipx already installed - adding to pkgman tracking"
+        _pkgman_track brew pipx "[internal] python application installer"
+        return 0
+      fi
+      
+      # Validate brew is available for pipx installation
+      _require_brew >/dev/null || return $?
+      
+      _pkgman_install brew pipx "[internal] python application installer"
+      ;;
+    linux)
+      if command -v apt &>/dev/null; then
+        _pkgman_install apt pipx "[internal] python application installer"
+      elif command -v dnf &>/dev/null; then
+        _pkgman_install dnf pipx "[internal] python application installer"
+      else
+        u.error "no supported package manager found for pipx installation"
+        return $_E_DEP
+      fi
+      ;;
+    *)
+      u.error "unsupported OS for pipx: $(u.os)"
+      return $_E_OS
+      ;;
+  esac
+  
+  u.info "✓ pipx installation completed"
+  
+  # Create the directory and run pipx ensurepath
+  echo "mkdir -p \"\${ZSH_SDK_BIN:-\$HOME/.local/bin}\""
+  echo "pipx ensurepath"
+  
+  u.info "pipx environment variables (can be customized):"
+  u.info "  ZSH_SDK_HOME (default: \$HOME) - base directory for SDKs"
+  u.info "  ZSH_SDK_BIN (default: \$ZSH_SDK_HOME/.local/bin) - shared binary directory"
+  u.info "  PIPX_BIN_DIR (default: \$ZSH_SDK_BIN) - executables, must be in PATH"
+  u.info "  PIPX_HOME (default: \$ZSH_SDK_HOME/.local/pipx) - virtual environments"
+  u.info "pipx ensurepath will check and guide PATH setup"
+}
+
+_pkgboot.pipx.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating pipx via pkgman"
+  _pkgman_run update pipx
+}
+
+_pkgboot.pipx.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for pipx - prevents deprovisioning"
+  return $_E_USG
+}
+
+_pkgboot.pipx.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  if command -v pipx &>/dev/null; then
+    u.info "pipx: installed"
+    exit 0
+  else
+    u.info "pipx: missing"
+    exit 1
+  fi
+}
+##] pipx
+
+##[ npm
+##@ Node.js package manager - use pkgman dogfooding
+_pkgboot.npm.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "installing npm via nvm (Node Version Manager)"
+  
+  case "$(u.os)" in
+    mac)
+      # Get brew prefix and validate brew is available
+      local _brew_prefix
+      _brew_prefix=$(_require_brew) || return $?
+      
+      # Check if nvm/npm is already installed
+      if (command -v nvm &>/dev/null || [[ -s "${NVM_DIR:-$ZSH_SDK_HOME/.nvm}/nvm.sh" ]] || [[ -s "$_brew_prefix/opt/nvm/nvm.sh" ]]) && [[ "$_force" != "true" ]]; then
+        u.info "nvm already installed - adding to pkgman tracking"
+        _pkgman_track brew nvm "[internal] node version manager"
+        u.info "using existing nvm to install Node.js LTS"
+      else
+        u.info "installing nvm via brew"
+        _pkgman_install brew nvm "[internal] node version manager"
+      fi
+      ;;
+    linux)
+      # For Linux, we could use the install script approach
+      u.info "nvm installation on Linux requires manual setup"
+      u.info "see: https://github.com/nvm-sh/nvm#install--update-script"
+      return 0
+      ;;
+    *)
+      u.error "unsupported OS for npm: $(u.os)"
+      return $_E_OS
+      ;;
+  esac
+  
+  # Setup nvm and install LTS Node
+  echo "mkdir -p \"\${NVM_DIR:-\$ZSH_SDK_HOME/.nvm}\""
+  echo "export NVM_DIR=\"\${NVM_DIR:-\$ZSH_SDK_HOME/.nvm}\""
+  # shellcheck disable=SC2028 # intentional: printing a literal shell snippet for the user to paste/run, not evaluating it here
+  echo "[ -s \"$_brew_prefix/opt/nvm/nvm.sh\" ] && \\\\. \"$_brew_prefix/opt/nvm/nvm.sh\""
+  echo "nvm install --lts"
+  
+  u.info "✓ npm installation completed via nvm"
+  u.info "nvm environment variables (can be customized):"
+  u.info "  ZSH_SDK_HOME (default: \$HOME) - base directory for SDKs"
+  u.info "  NVM_DIR (default: \$ZSH_SDK_HOME/.nvm) - nvm installation directory"
+  u.info "nvm manages Node.js versions and npm automatically"
+  u.info "Add to shell profile: [ -s \"$_brew_prefix/opt/nvm/nvm.sh\" ] && \\\\. \"$_brew_prefix/opt/nvm/nvm.sh\""
+}
+
+_pkgboot.npm.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "updating npm via pkgman"
+  
+  case "$(u.os)" in
+    mac) _pkgman_run update node ;;
+    linux)
+      if command -v apt &>/dev/null; then
+        _pkgman_run update nodejs
+        _pkgman_run update npm
+      elif command -v dnf &>/dev/null; then
+        _pkgman_run update nodejs
+      fi
+      ;;
+  esac
+}
+
+_pkgboot.npm.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for npm - prevents deprovisioning"
+  return $_E_USG
+}
+
+_pkgboot.npm.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  if command -v npm &>/dev/null; then
+    u.info "npm: installed"
+    exit 0
+  else
+    u.info "npm: missing"
+    exit 1
+  fi
+}
+##] npm
+
+##[ download
+##@ Download manager - no bootstrapping needed (uses curl/wget)
+_pkgboot.download.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "download manager requires no bootstrapping"
+
+  # Check if curl is available (required for download operations)
+  if command -v curl &>/dev/null; then
+    u.info "curl available - download manager ready"
+  elif command -v wget &>/dev/null; then
+    u.info "wget available - download manager ready"
+  else
+    u.error "neither curl nor wget available - download operations will fail"
+    return $_E_DEP
+  fi
+
+  u.info "✓ download manager verified"
+}
+
+_pkgboot.download.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "download manager requires no updates"
+}
+
+_pkgboot.download.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for download manager - core system dependency"
+  return $_E_USG
+}
+
+_pkgboot.download.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  if command -v curl &>/dev/null || command -v wget &>/dev/null; then
+    u.info "download: installed"
+    exit 0
+  else
+    u.info "download: missing"
+    exit 1
+  fi
+}
+##] download
+
+##[ github
+##@ GitHub manager - depends on download capabilities
+_pkgboot.github.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "github manager requires no bootstrapping"
+
+  # Check if curl is available (required for GitHub API calls)
+  if command -v curl &>/dev/null; then
+    u.info "curl available - github manager ready"
+  else
+    u.error "curl not available - github operations will fail"
+    return $_E_DEP
+  fi
+
+  u.info "✓ github manager verified"
+}
+
+_pkgboot.github.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "github manager requires no updates"
+}
+
+_pkgboot.github.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for github manager - core system dependency"
+  return $_E_USG
+}
+
+_pkgboot.github.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  if command -v curl &>/dev/null; then
+    u.info "github: installed"
+    exit 0
+  else
+    u.info "github: missing"
+    exit 1
+  fi
+}
+##] github
+
+##[ script
+##@ Script manager - no bootstrapping needed (uses bash)
+_pkgboot.script.install() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "script manager requires no bootstrapping"
+  u.info "bash shell available - script manager ready"
+  u.info "✓ script manager verified"
+}
+
+_pkgboot.script.update() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.info "script manager requires no updates"
+}
+
+_pkgboot.script.uninstall() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  u.error "uninstall not supported for script manager - core system dependency"
+  return $_E_USG
+}
+
+_pkgboot.script.status() {
+  local _dest="$1" _artifact="$2" _force="${3:-false}"
+  # bash is always available (required for pkgboot itself)
+  u.info "script: installed"
+  exit 0
+}
+##] script
+
+##[ help
+##@ Show help for specific managers
+_show_manager_help() {
+  local _manager="$1"
+  
+  case "$_manager" in
+    brew)
+      cat << EOF
+pkgboot brew - Bootstrap Homebrew package manager
+
+DESCRIPTION:
+    Manually installs Homebrew, the foundation package manager for macOS and Linux.
+    This is the only manager that requires manual installation - all others use
+    pkgman dogfooding approach.
+
+REQUIREMENTS:
+    macOS: Xcode Command Line Tools
+    Linux: build-essential, curl
+
+INSTALLATION:
+    Downloads and runs official Homebrew installer script
+    Configures PATH for immediate availability
+
+NOTES:
+    - brew is the foundation for dogfooding other managers
+    - Uninstall not supported (system dependency)
+    - Updates brew itself via 'brew update'
+EOF
+      ;;
+    mas)
+      cat << EOF
+pkgboot mas - Bootstrap Mac App Store CLI
+
+DESCRIPTION:
+    Installs 'mas' command-line interface for Mac App Store via pkgman dogfooding.
+    Allows scripted installation of Mac App Store applications.
+
+REQUIREMENTS:
+    macOS only
+    Homebrew must be installed first
+
+DOGFOODING:
+    pkgman add mas mas --scope system
+    pkgman install mas
+
+NOTES:
+    - macOS only
+    - Requires Apple ID login to Mac App Store
+    - Uninstall not supported (prevents deprovisioning)
+EOF
+      ;;
+    cargo)
+      cat << EOF
+pkgboot cargo - Bootstrap Rust package manager
+
+DESCRIPTION:
+    Installs Rust programming language with cargo package manager via pkgman dogfooding.
+    Enables installation of Rust applications and development tools.
+
+REQUIREMENTS:
+    Homebrew (macOS) or system package manager (Linux)
+
+DOGFOODING:
+    pkgman add brew rustup --scope system --detail \"Rust toolchain installer with cargo\"
+    pkgman install rustup
+
+NOTES:
+    - Installs complete Rust toolchain including rustc, cargo, rustup
+    - Uninstall not supported (prevents deprovisioning)
+    - Cross-platform support
+EOF
+      ;;
+    go)
+      cat << EOF
+pkgboot go - Bootstrap Go programming language
+
+DESCRIPTION:
+    Installs Go programming language via platform-specific package managers
+    using pkgman dogfooding. Uses OS-specific installation methods.
+
+REQUIREMENTS:
+    macOS: Homebrew
+    Linux: apt or dnf
+
+DOGFOODING:
+    macOS: pkgman add brew go --scope system
+    Linux: pkgman add apt golang-go --scope system (Ubuntu)
+           pkgman add dnf golang --scope system (Fedora)
+
+NOTES:
+    - OS-specific installation methods
+    - Configures GOPATH and GOBIN automatically
+    - Uninstall not supported (prevents deprovisioning)
+EOF
+      ;;
+    pipx)
+      cat << EOF
+pkgboot pipx - Bootstrap Python application installer
+
+DESCRIPTION:
+    Installs pipx for isolated Python application installation via pkgman dogfooding.
+    Enables safe installation of Python CLI tools without dependency conflicts.
+
+REQUIREMENTS:
+    Python 3.6+ (usually pre-installed)
+    System package manager
+
+DOGFOODING:
+    macOS: pkgman add brew pipx --scope system
+    Linux: pkgman add apt pipx --scope system
+
+NOTES:
+    - Installs Python applications in isolated virtual environments
+    - Safer than pip install --user for CLI tools
+    - Uninstall not supported (prevents deprovisioning)
+EOF
+      ;;
+    npm)
+      cat << EOF
+pkgboot npm - Bootstrap Node.js package manager
+
+DESCRIPTION:
+    Installs Node.js and npm via nvm (Node Version Manager) for professional
+    Node.js development. nvm provides version management and avoids system conflicts.
+
+REQUIREMENTS:
+    macOS: Homebrew
+    Linux: Manual nvm installation (see nvm documentation)
+
+DOGFOODING:
+    macOS: pkgman add brew nvm --scope system
+           nvm install --lts
+
+NOTES:
+    - Uses nvm for Node.js version management (industry standard)
+    - nvm manages Node.js versions and npm automatically
+    - Avoids system-level npm conflicts and permissions issues
+    - Requires shell profile setup for nvm integration
+EOF
+      ;;
+    download)
+      cat << EOF
+pkgboot download - Bootstrap download manager
+
+DESCRIPTION:
+    Validates download capabilities (curl/wget) for pkgman download operations.
+    No actual installation required - verifies system dependencies.
+
+REQUIREMENTS:
+    curl or wget (usually pre-installed)
+
+NOTES:
+    - Utility manager - no bootstrapping needed
+    - Validates curl or wget availability
+    - Used by pkgman for direct URL downloads
+    - Core system dependency
+EOF
+      ;;
+    github)
+      cat << EOF
+pkgboot github - Bootstrap GitHub manager
+
+DESCRIPTION:
+    Validates GitHub API capabilities (curl) for pkgman GitHub release operations.
+    No actual installation required - verifies system dependencies.
+
+REQUIREMENTS:
+    curl (for GitHub API calls)
+
+NOTES:
+    - Utility manager - no bootstrapping needed  
+    - Validates curl availability for API calls
+    - Used by pkgman for GitHub release downloads
+    - Core system dependency
+EOF
+      ;;
+    script)
+      cat << EOF
+pkgboot script - Bootstrap script manager
+
+DESCRIPTION:
+    Validates bash shell availability for pkgman script execution.
+    No actual installation required - bash is always available.
+
+REQUIREMENTS:
+    bash shell (required for pkgboot itself)
+
+NOTES:
+    - Utility manager - no bootstrapping needed
+    - bash is always available (pkgboot requirement)
+    - Used by pkgman for custom installation scripts
+    - Core system dependency
+EOF
+      ;;
+    *)
+      u.error "no help available for manager: $_manager"
+      return $_E_USG
+      ;;
+  esac
+}
+
+_help() {
+  cat << EOF
+$(_version) - Universal package manager bootstrap installer
+
+USAGE:
+    # Script manager interface (called by pkgman)
+    $__APP <action> <manager> [--dest=<path>] [--artifact=<name>]
+    
+    # Independent execution
+    $__APP [OPTIONS] <action> [manager]
+
+ACTIONS:
+    install <manager>    Install/provision the specified package manager
+    update <manager>     Update the specified package manager  
+    uninstall <manager>  Remove the package manager (not supported - prevents deprovisioning)
+    status <manager>     Check if package manager is installed (returns: installed/missing)
+    help [manager]       Show help for specific manager or general help
+
+OPTIONS:
+    -h                   Show this help
+    -v                   Show version
+
+SUPPORTED MANAGERS:
+    brew                 Homebrew package manager (manual installation)
+    apt                  APT package manager (system dependency)
+    dnf                  DNF package manager (system dependency)  
+    mas                  Mac App Store CLI (dogfooding via brew)
+    cargo                Rust package manager (dogfooding via brew)
+    go                   Go programming language (dogfooding, OS-specific)
+    pipx                 Python application installer (dogfooding)
+    npm                  Node.js package manager (dogfooding)
+    download             Download manager (utility - validates curl/wget)
+    github               GitHub manager (utility - validates GitHub API access)
+    script               Script manager (utility - validates bash availability)
+
+BOOTSTRAP STRATEGY:
+    1. Manual Installation: brew (foundation package manager)
+    2. Dogfooding: mas, cargo, go, pipx, npm installed via pkgman using brew
+    3. System Dependencies: apt/dnf assumed pre-installed on respective systems
+    4. Utility Managers: download, github, script validate system dependencies
+
+EXAMPLES:
+    # Script manager interface
+    $__APP install brew
+    $__APP status mas
+    
+    # Independent execution
+    $__APP install cargo
+    $__APP help go
+    $__APP status npm
+
+INTEGRATION:
+    This script complies with pkgman script manager interface while supporting
+    independent execution. It's designed to be called by pkgman's script manager
+    but can also be run directly for manual bootstrapping.
+
+NOTES:
+    - Uninstall operations are not supported to prevent system deprovisioning
+    - Uses pkgman dogfooding approach where possible for consistency
+    - brew installation is manual (foundation for other installations)
+    - System package managers (apt/dnf) are assumed to be pre-installed
+EOF
+}
+
+_version() { 
+  [[ "$__PIPED" == true ]] && echo "0.0.0" || \
+  sed -n 's/^# VERSION:[[:space:]]*\(.*\)/\1/p' "$__APPFILE" 2>/dev/null || echo "unknown"; 
+}
+
+_cleanup() {
+  u.debug "cleanup"
+  return 0
+}
+##] help
+
+##) app
+
+##( core
+_boot() {
+  [[ "$__PIPED" == true && "$__ALLOW_PIPED" == false ]] && { u.error "script is disabled in piped mode"; exit $_E_PIPE; }
+  printf '%s\n' "${__OS[@]:-}" | grep -Fxq "$(u.os)" || u.die "unsupported OS: $(u.os) [required: ${__OS[*]:-}]"
+  local _tool; for _tool in "${__APP_DEPS[@]:-}"; do u.require "$_tool"; done
+}
+
+trap _cleanup EXIT
+_boot
+_main "$@"
+##) core
