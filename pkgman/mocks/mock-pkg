@@ -1,0 +1,15 @@
+#!/bin/bash
+# mock script-handler package: marker file under $MOCK_STATE (default /tmp/mock-pkg-state)
+set -euo pipefail
+ACTION="${1:?action}"; FORCE="${2:-false}"; shift 2 || true
+STATE="${MOCK_STATE:-/tmp/mock-pkg-state}"; mkdir -p "$STATE"
+NAME="mock-pkg"
+for a in "$@"; do case "$a" in --name=*) NAME="${a#--name=}";; esac; done
+case "$ACTION" in
+  install)   touch "$STATE/$NAME"; echo "mock installed $NAME" ;;
+  update)    [ -f "$STATE/$NAME" ] && echo "mock updated $NAME" || exit 1 ;;
+  uninstall) rm -f "$STATE/$NAME"; echo "mock uninstalled $NAME" ;;
+  status)    [ -f "$STATE/$NAME" ] && echo "installed" || echo "missing" ;;
+  validate)  exit 0 ;;
+  *) exit 2 ;;
+esac

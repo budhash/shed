@@ -1204,16 +1204,16 @@ _cmd_status() {
   return 0
 }
 
-##@ Add an existing package to tracking without installing (OLD VERSION)
+##@ Add an existing package to tracking without installing
 ##@ Uses unified parameter interface: <manager> <package> [--source] [--dest] [--artifact] [--key=value...]
-_cmd_add_old() {
+_cmd_add() {
   local _manager="${1:-}" _package="${2:-}"
   _pkglib.require_params "manager" "$_manager" "package name" "$_package" || u.die "invalid parameters for add command: manager='$_manager' package='$_package'"
   shift 2
   
   # Initialize unified parameters with defaults
-  local _source="" _dest="" _artifact="" _scope="$PKGMAN_DEFAULT_SCOPE"
-  local _os="" _sudo="" _detail="" _channel=""
+  local _source="default" _dest="default" _artifact="default" _scope="$PKGMAN_DEFAULT_SCOPE"
+  local _os="default" _sudo="false" _detail="" _channel="default"
   local _param_install="" _param_update="" _param_uninstall="" _param_sync=""
   
   # Parse optional parameters

@@ -34,4 +34,19 @@ test_cli_basics() {
   assert_fail $TOOL definitely-not-a-cmd "unknown command fails"
 }
 
+test_add_and_install() {
+  _section_header "P0: add + install via script handler"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+  # --name=demo exercises the generic --key=value kwarg parser (must not crash the
+  # add command), but a pre-existing, out-of-scope bug in _cmd_add_unified never
+  # forwards kwargs on to pkglib, so the mock still falls back to its own default
+  # name ("mock-pkg") for the marker file.
+  assert_ok $TOOL add script demo --source "$PWD/mocks/mock-pkg" --detail "demo pkg" --name=demo "add succeeds"
+  assert_ok grep -q '^demo.manager=script' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "metadata written to index"
+  assert_ok $TOOL install demo "install runs the mock"
+  assert_file_exists "$MOCK_STATE/mock-pkg" "mock marker created"
+  assert_contains "$($TOOL status demo 2>&1)" "installed" "status sees installed"
+}
+
 _test_runner
