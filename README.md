@@ -7,9 +7,11 @@ A collection of useful tools and scripts in various languages (mainly shell) cov
 
 ## What's in the shed?
 
+- **[`pkgman/`](pkgman/)** - Universal package manager CLI with state tracking across 13 managers
 - **[`sem-ver/`](sem-ver/)** - Semantic version bumping and management
 - **[`git-tag/`](git-tag/)** - Git tag management with semantic versioning
 - **[`ver-kit/`](ver-kit/)** - Universal version extraction and update toolkit
+- **[`lib/common/loam/`](lib/common/loam/)** - Generic bash stdlib (logging, OS detection, filesystem, networking)
 - **[`.template/`](.template/)** - Template for creating new tools (also tested)
 
 ## Philosophy
