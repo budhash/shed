@@ -20,6 +20,18 @@ test_pkglib_loads() {
   assert_ok declare -F pkglib.common.install "common template present"
   assert_ok declare -F pkglib.common.update "common template present"
   assert_ok declare -F pkglib.common.uninstall "common template present"
+  assert_ok declare -F loam.confirm "pkglib provides loam.confirm"
+}
+
+setup_cfg() { PKGMAN_CONFIG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pkgman-cfg-XXXXXX"); export PKGMAN_CONFIG_DIR; }
+
+test_cli_basics() {
+  _section_header "CLI basics"
+  setup_cfg
+  assert_ok $TOOL version "version exits 0"
+  assert_ok $TOOL help "help exits 0"
+  assert_contains "$($TOOL help 2>&1)" "install-all" "help mentions install-all"
+  assert_fail $TOOL definitely-not-a-cmd "unknown command fails"
 }
 
 _test_runner
