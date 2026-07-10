@@ -1,2 +1,2904 @@
-#!/bin/bash
-# placeholder — replaced by pkgman-revive Tasks 2-4
+##( header
+# --------------------------------------------------------------------
+# radix - core utility function library
+# --------------------------------------------------------------------
+# File: $HOME/.local/bin/radix ← ~/radix/shed/core/lib/radix
+# Info: Core utility function library for Zsh environment and setup scripts.
+# Note: 100+ functions covering file ops, networking, system functions, logging.
+#       Cross-platform compatible (macOS/Linux), dependency-free core.
+# --------------------------------------------------------------------
+##) header
+
+##( initialize
+[[ "${ZSH_DEBUG:-}" == "true" ]] && echo "[debug] loading: radix" >&2
+##) initialize
+
+##( initialization
+# Script Behavior Options:
+_prev_errexit_status=0
+[[ -o errexit ]] && _prev_errexit_status=1
+
+# set -e  # Exit immediately if a command exits with a non-zero status.
+set -u  # Treat unset variables as an error when substituting.
+set -o pipefail # The return value of a pipeline is the status of the last command to exit with a non-zero status.
+
+# Include Guard: prevents multiple sourcing in the same shell session
+if [[ -n "${_RADIX_SOURCED:-}" && "$_RADIX_SOURCED" == true ]]; then
+  # Safe cross-shell check for sourcing
+  if [[ "${ZSH_EVAL_CONTEXT:-}" == *"source"* ]] || [[ "${BASH_SOURCE[0]:-}" != "${0:-}" ]]; then
+    return 0 # Already sourced, and currently being sourced again
+  fi
+fi
+_RADIX_SOURCED=true
+
+# Set _RDEBUG flag based on global ZSH_DEBUG environment variable
+_RDEBUG=false
+if [[ "${ZSH_DEBUG:-false}" == "true" ]]; then
+  _RDEBUG=true
+fi
+
+_RPATH="$HOME/.local/bin/radix"
+##) initialization
+
+##( constants
+
+# Colors
+_RCLR_RESET="" _RCLR_GREEN="" _RCLR_YELLOW="" _RCLR_RED="" _RCLR_BLUE=""
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then # Check if NO_COLOR is unset or empty
+  _RCLR_RESET="\033[0m" 
+  _RCLR_GREEN="\033[0;32m"
+  _RCLR_YELLOW="\033[0;33m" 
+  _RCLR_RED="\033[0;31m" 
+  _RCLR_BLUE="\033[0;34m"
+fi
+
+# ERROR
+_S=0 				  # Success
+_E=1 			    # General failure
+_E_USG=2 		  # Bad usage / invalid arguments
+_E_DEP=3 			# Dependency not found
+_E_OS=4 			# Unsupported OS
+_E_NF=5 			# Not Found
+_E_NP=6 			# Permission Error
+_E_NC=7 			# Not Connected
+##) constants
+
+##( functions
+##[ logging
+
+loam.log()   { echo -e "${_RCLR_GREEN:-}[info ]${_RCLR_RESET:-} $*" >&2; return 0; }
+loam.warn()  { echo -e "${_RCLR_YELLOW:-}[warn ]${_RCLR_RESET:-} $*" >&2; return 0; }
+loam.error() { echo -e "${_RCLR_RED:-}[error]${_RCLR_RESET:-} $*" >&2; return 0; }
+loam.debug() { $_RDEBUG &&  echo -e "${_RCLR_BLUE:-}[debug]${_RCLR_RESET:-} $*" >&2; return 0; }
+loam.die()   { loam.error "$@"; exit "$_E"; }
+
+# compat shims (deprecated; call sites migrate over time)
+_log()   { loam.log "$@"; }
+_warn()  { loam.warn "$@"; }
+_error() { loam.error "$@"; }
+_debug() { loam.debug "$@"; }
+_die()   { loam.die "$@"; }
+
+loam.os()   { case "$(uname)" in Darwin) echo mac;; Linux) echo linux;; *) echo unknown;; esac; }
+loam.arch() { uname -m; }
+loam.has()  { command -v "$1" >/dev/null 2>&1; }
+loam.mkdir()   { loam.make-dir "$@"; }      # canonical short names per loam-api.md
+loam.symlink() { loam.make-symlink "$@"; }
+loam.backup()  { loam.make-backup "$@"; }
+loam.download(){ loam.url-download "$@"; }
+##] logging
+
+##[ os
+
+# info: return the current operating system : mac / linux / win (or unknown)
+# usage: os
+os() { case "$OSTYPE" in darwin*) echo "mac" ;; linux*) echo "linux" ;; msys*|cygwin*|mingw*) echo "win" ;; *) echo "unknown" ;; esac; }
+
+# info: return the current operating system with version (e.g., mac-13.4.1, ubuntu-22.04)
+# usage: os-ver
+loam.os-ver() {
+  case "$OSTYPE" in
+    darwin*) echo "mac-$(sw_vers -productVersion)" ;;
+    linux*) [[ -f /etc/os-release ]] && { source /etc/os-release; echo "${ID:-linux}-${VERSION_ID:-unknown}"; } || echo "linux-unknown" ;;
+    msys*|cygwin*|mingw*) echo "win-$(cmd.exe /c ver 2>/dev/null | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo unknown)" ;;
+    *) echo "unknown-unknown" ;;
+  esac
+}
+##] os
+
+##[ user-input
+
+loam.read() {
+  local _prompt="${1-}" _char_mode="${2:-false}" _result=""
+  
+  echo -en "${_RCLR_YELLOW:-}>> $_prompt ${_RCLR_RESET:-}" >&2
+  
+  # Cross-shell input handling
+  if [[ "$_char_mode" == "true" ]]; then
+    # Single character input - shell-specific
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+      read -k1 -r _result </dev/tty    	# zsh: -k1 for single char
+    elif [[ -n "${BASH_VERSION:-}" ]]; then
+      read -n1 -r _result </dev/tty    	# bash: -n1 for single char
+    else
+      read -r _result </dev/tty			# Fallback for other shells - read full line
+      _result="${_result:0:1}"         	# Take only first character
+    fi
+  else
+    read -r _result </dev/tty			# Line input - universal across shells
+  fi
+  
+  echo "" >&2    # Add newline after input
+  printf "%s" "$_result"
+}
+
+# info: reads multi-line text from the terminal until EOF (Ctrl+D)
+# usage: my_text=$(loam.readtext "Paste text here:")
+loam.readtext() {
+  local _prompt="${1-}"
+  echo -en "${_RCLR_YELLOW:-}>> $_prompt ${_RCLR_RESET:-}" >&2
+  echo "" >&2 # Add a newline so user input starts on the next line.
+  
+  local _result
+  # Harden by explicitly reading from the terminal, just like loam.read
+  _result=$(cat </dev/tty)
+  
+  printf "%s" "$_result"
+}
+
+loam.readline() { loam.read "${1-:-Enter line:}" false; echo; } # usage: my_var=$(loam.readline "Enter value: ")
+loam.readchar() { loam.read "${1-}" true; echo; } # usage: my_char=$(loam.readchar "Choose [Y/n]: ")
+loam.confirm() { # usage: if loam.confirm "Proceed?"; then ...; fi
+    local _response; _response=$(loam.readchar "${1-}[y/N]:")
+    case "$_response" in [yY]) return 0 ;; *) return 1 ;; esac
+}
+
+# info: retrieves input from stdin, with optional fallbacks (clipboard then prompt)- stdin > clipboard > interactive prompt.
+# usage: get-input [-c] [-i <mode: line/text>] [-p <prompt_text>]
+loam.get-input() {
+  local _use_clipboard=false
+  local _interactive_mode=""
+  local _prompt_text=""
+  local OPTIND opt
+
+  while getopts "ci:p:h" opt; do
+    case "$opt" in
+      c) _use_clipboard=true ;;
+      i) _interactive_mode="$OPTARG" ;;
+      p) _prompt_text="$OPTARG" ;;
+      h|*)
+        echo "usage: get-input [-c] [-i <mode: line/text>] [-p <prompt_text>]" >&2
+        return $_E_USG
+        ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  # 1. Always check for non-interactive piped input first.
+  if [[ ! -t 0 ]]; then
+    cat
+    return 0
+  fi
+
+  # If stdin is interactive, proceed to fallbacks if they are enabled.
+
+  # 2. Check clipboard if enabled.
+  if [[ "$_use_clipboard" == true ]]; then
+    local _clipboard_content
+    _clipboard_content=$(loam.clip-get)
+    if [[ -n "$_clipboard_content" ]]; then
+      _log "reading data from clipboard..."
+      printf "%s" "$_clipboard_content"
+      return 0
+    fi
+  fi
+
+  # 3. Check for interactive prompt if a mode was specified.
+  if [[ -n "$_interactive_mode" ]]; then
+    case "$_interactive_mode" in
+      line)
+        loam.readline "${_prompt_text:-Enter line:}"
+        ;;
+      text)
+        loam.readtext "${_prompt_text:-Enter text (end with Ctrl+D):}"
+        ;;
+      *)
+        _error "invalid interactive mode '$_interactive_mode' - use 'line' or 'text'"; return 1
+        ;;
+    esac
+    return 0
+  fi
+
+  # 4. If we reach here, stdin was interactive and no valid fallback was found.
+  _error "no input found on stdin and no fallback data source was enabled"
+  return 1
+}
+##] user-input
+
+##[ system
+
+# info: get system hostname across different operating systems
+# usage: get-hostname
+loam.get-hostname() {
+  local OPTIND; getopts "h" _ && { echo "usage: get-hostname" >&2; return $_E_USG; }; shift $((OPTIND-1))
+
+  local _os=$(os)
+  case "$_os" in
+    mac) scutil --get ComputerName 2>/dev/null || hostname ;;
+    linux) hostname ;;
+    *) hostname ;;
+  esac
+}
+
+# info: set system hostname across different operating systems
+# usage: set-hostname <new_hostname>
+loam.set-hostname() {
+  local OPTIND; getopts "h" _ && { echo "usage: set-hostname <new_hostname>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _hostname="${1-}"
+  local _current_hostname
+  local _os
+
+  if [[ -z "$_hostname" ]]; then echo "usage: set-hostname <new_hostname>" >&2; return $_E_USG; fi
+
+  # This regex allows single letters and longer valid hostnames.
+  if ! [[ "$_hostname" =~ ^[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9]|[a-zA-Z0-9]{0,61})?$ ]]; then
+    _error "invalid hostname: '$_hostname'. use alphanumeric, hyphens (not start/end)"; return 1
+  fi
+
+  _os=$(os)
+
+  case "$_os" in
+    mac)
+      if ! command -v scutil &>/dev/null; then _error "scutil not found on macOS"; return $_E_DEP; fi
+      _current_hostname=$(scutil --get ComputerName 2>/dev/null)
+      if [[ "$_current_hostname" == "$_hostname" ]]; then _log "hostname already '$_hostname' on macOS"; return 0; fi
+
+      _log "setting macOS hostname to '$_hostname'..."
+      if sudo scutil --set ComputerName "$_hostname" && \
+         sudo scutil --set HostName "$_hostname" && \
+         sudo scutil --set LocalHostName "$_hostname" && \
+         sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server NetBIOSName -string "$_hostname" && \
+         sudo hostname "$_hostname"; then
+        _log "macOS hostname set to '$_hostname' - reboot/restart services may be needed"
+        return 0
+      else
+        _error "failed to set hostname on macOS"; return 1
+      fi
+      ;;
+
+    linux)
+      _current_hostname=$(hostname)
+      if [[ "$_current_hostname" == "$_hostname" ]]; then _log "hostname already '$_hostname' on Linux"; return 0; fi
+
+      if command -v hostnamectl &>/dev/null; then
+        _log "setting Linux hostname to '$_hostname' via hostnamectl..."
+        if sudo hostnamectl set-hostname "$_hostname"; then
+          _log "linux hostname set to '$_hostname' - reboot/restart services may be needed"; return 0
+        else
+          _error "hostnamectl failed to set hostname"; return 1
+        fi
+      else
+        _warn "hostnamectl not found. attempting limited manual change"
+        if [[ -f /etc/hostname ]]; then
+          echo "$_hostname" | sudo tee /etc/hostname > /dev/null && sudo hostname "$_hostname"
+          # shellcheck disable=SC2181 # legacy, pre-loam: checks the exit code of the preceding && chain, not fixing to avoid touching legacy-unstable control flow
+          if [[ $? -eq 0 ]]; then
+            _log "/etc/hostname updated; runtime hostname set to '$_hostname'"
+            _warn "manual /etc/hosts update may be needed - reboot recommended"
+            return 0
+          else
+            _error "failed to update /etc/hostname or set runtime hostname"; return 1
+          fi
+        elif [[ -f /etc/sysconfig/network ]]; then # Older RHEL/CentOS
+          if sudo sed -i.bak "s/^\(HOSTNAME=\).*/\1$_hostname/" /etc/sysconfig/network && sudo hostname "$_hostname"; then
+            _log "/etc/sysconfig/network updated; runtime hostname set to '$_hostname'"
+            _warn "manual /etc/hosts update may be needed - reboot recommended"
+            return 0
+          else
+            _error "failed to update /etc/sysconfig/network or set runtime hostname"; return 1
+          fi
+        else
+          _error "cannot auto-set hostname: /etc/hostname or /etc/sysconfig/network not found - set hostname manually per your Linux distribution's docs"; return $_E_DEP
+        fi
+      fi
+      ;;
+    *) _error "unsupported operating system: $_os"; return $_E_OS ;;
+  esac
+}
+##] system
+
+##[ filesystem
+
+# info: set ownership of a file/directory to the real user when running under sudo
+# usage: set-real-owner [-s (use sudo)] <path>
+loam.set-real-owner() {
+  local _use_sudo=false
+  
+  local OPTIND opt
+  while getopts "sh" opt; do
+    case $opt in
+      s) _use_sudo=true ;;
+      *) echo "usage: set-real-owner [-s (use sudo)] <path>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND-1))
+  
+  local _path="${1-}"
+  if [[ -z "$_path" ]]; then echo "usage: set-real-owner [-s (use sudo)] <path>" >&2; return $_E_USG; fi
+  if [[ ! -e "$_path" ]]; then echo "error: path does not exist: $_path"; return $_E_NF; fi
+  
+  # If not using sudo and not running as root, nothing to do
+  if [[ "$_use_sudo" != true && "$(id -u)" -ne 0 ]]; then return 0; fi
+  
+  # Get the real user who invoked sudo
+  local _real_user="${SUDO_USER:-$(logname 2>/dev/null || echo $USER)}"  
+  local _real_group="$(id -gn $_real_user 2>/dev/null || id -gn)"
+  
+  # Apply ownership change - use -h for symlinks, -R for directories
+  if $_use_sudo; then
+    if [[ -L "$_path" ]]; then
+      sudo chown -h "${_real_user}:${_real_group}" "$_path"     # Path is a symlink
+    elif [[ -d "$_path" ]]; then
+      sudo chown -R "${_real_user}:${_real_group}" "$_path"     # Path is a directory
+    else
+      sudo chown "${_real_user}:${_real_group}" "$_path"        # Path is a regular file or other type
+    fi
+  else
+    if [[ -L "$_path" ]]; then
+      chown -h "${_real_user}:${_real_group}" "$_path"     # Path is a symlink
+    elif [[ -d "$_path" ]]; then
+      chown -R "${_real_user}:${_real_group}" "$_path"     # Path is a directory
+    else
+      chown "${_real_user}:${_real_group}" "$_path"        # Path is a regular file or other type
+    fi
+  fi
+  return $?
+}
+
+# info: create a directory with permission handling based on execution context
+# usage: make-dir [-p (set ownership to the real user when using sudo)] [-q (quiet mode)] [-s (use sudo)] <path>
+loam.make-dir() {
+  local _chown=false
+  local _quiet=false
+  local _use_sudo=false
+  
+  local OPTIND opt
+  while getopts "pqsh" opt; do
+    case $opt in
+      p) _chown=true ;;
+      q) _quiet=true ;;
+      s) _use_sudo=true ;;
+      *) echo "usage: make-dir [-p set ownership to the real user (when using sudo)] [-q quiet mode] [-s use sudo] <path>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND-1))
+  
+  local _path=${1-}
+  
+  if [[ -z "$_path" ]]; then echo "usage: make-dir [-p set ownership to the real user (when using sudo)] [-q quiet mode] [-s use sudo] <path>" >&2; return $_E_USG; fi
+  
+  # Check if directory already exists
+  if [[ -d "$_path" ]]; then return 0; fi
+  
+  # Create the directory
+  if $_use_sudo; then
+    if sudo mkdir -p "$_path"; then
+      $_chown && loam.set-real-owner -s "$_path"
+      ! $_quiet && _log "created directory: $_path"
+      return 0
+    else
+      ! $_quiet && _error "failed to create directory: $_path"
+      return 1
+    fi
+  else
+    if mkdir -p "$_path"; then
+      $_chown && loam.set-real-owner "$_path"
+      ! $_quiet && _log "created directory: $_path"
+      return 0
+    else
+      ! $_quiet && _error "failed to create directory: $_path"
+      return 1
+    fi
+  fi
+}
+
+# info: creates a symbolic link; handles root links via make-root-symlink (macos/linux)
+# usage: make-symlink [-p (set link owner to real user)] <source_path> <link_path>
+loam.make-symlink() {
+  local _chown_link_flag=false
+  
+  local OPTIND opt
+  while getopts "ph" opt; do
+    case $opt in
+      p) _chown_link_flag=true ;;
+      *) echo "usage: make-symlink [-p] <source_path> <link_path>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  local _source_path="${1-}"
+  local _link_path="${2-}"
+
+  if [[ -z "$_source_path" || -z "$_link_path" ]]; then echo "usage: make-symlink [-p] <source_path> <link_path>" >&2; return $_E_USG; fi
+
+  # It's okay for source not to exist for a symlink, ln -s allows it.
+  [[ ! -e "$_source_path" ]] && _warn "make-symlink: source '$_source_path' does not exist. creating potentially broken link"
+
+  # Check for Root Link Case: target is /name (not /foo/bar, not /)
+  local _link_parent_dir
+  _link_parent_dir=$(dirname "$_link_path")
+
+  if [[ "$_link_path" == /* && "$_link_parent_dir" == "/" && "$_link_path" != "/" ]]; then
+    local _current_os_for_root_check
+    _current_os_for_root_check=$(os)
+    if [[ "$_current_os_for_root_check" == "mac" || "$_current_os_for_root_check" == "linux" ]]; then
+      _log "root link '$_link_path' detected, delegating to make-root-symlink"
+      local _abs_source_path_for_root=""
+
+      if [[ "$_source_path" == /* ]]; then
+        _abs_source_path_for_root="$_source_path"
+      else # _source_path is relative, attempt to resolve
+        if command -v realpath &>/dev/null; then
+          local _realpath_output
+          _realpath_output=$(realpath -m "$_source_path" 2>/dev/null)
+          if [[ -n "$_realpath_output" && "$_realpath_output" == /* ]]; then
+            _abs_source_path_for_root="$_realpath_output"
+          fi
+        fi
+
+        if [[ -z "$_abs_source_path_for_root" ]]; then # If realpath failed or not available
+          if [[ -e "$_source_path" ]]; then # Try cd/pwd if source exists
+            local src_dir_component src_basename_component resolved_dir_path
+            src_dir_component=$(dirname "$_source_path")
+            src_basename_component=$(basename "$_source_path")
+            resolved_dir_path=$( (cd "$src_dir_component" 2>/dev/null && pwd -P) )
+            if [[ -n "$resolved_dir_path" && -d "$resolved_dir_path" ]]; then
+              _abs_source_path_for_root="$resolved_dir_path/$src_basename_component"
+              _abs_source_path_for_root="${_abs_source_path_for_root//\/\///}" # Normalize //
+            fi
+          elif [[ "$_source_path" != */* ]]; then # Relative, non-existent, simple name
+            _abs_source_path_for_root="$PWD/$_source_path"
+          fi
+        fi
+      fi
+
+      if [[ -z "$_abs_source_path_for_root" || "$_abs_source_path_for_root" != /* ]]; then
+        _error "make-symlink: could not resolve '$_source_path' to absolute for root link target"
+        _warn "(final attempted: '$_abs_source_path_for_root'). ensure source is absolute, exists, or working realpath is installed"
+        return 1
+      fi
+      
+      local -a root_link_opts=()
+      $_chown_link_flag && root_link_opts+=(-r) # Pass -r to make-root-symlink
+
+      loam.make-root-symlink "${root_link_opts[@]}" "$(basename "$_link_path")" "$_abs_source_path_for_root"
+      return $? # Propagate exit status of make-root-symlink
+    fi
+    # If not mac/linux, root link creation falls through to standard ln -sfn, which will likely fail for /link without sudo.
+    # This is acceptable; make-root-symlink is the specialized handler.
+  fi
+
+  _log "standard symlink '$_link_path' -> '$_source_path'"
+  if [[ -L "$_link_path" ]]; then # Link exists
+    if [[ "$(readlink "$_link_path")" == "$_source_path" ]]; then
+      _log "symlink '$_link_path' already correct"
+      # Even if correct, apply ownership if requested (idempotent for ownership)
+      $_chown_link_flag && loam.set-real-owner "$_link_path"
+      return 0
+    fi
+    _log "symlink '$_link_path' exists but differs, re-creating"
+    # ln -sfn will overwrite
+  elif [[ -e "$_link_path" ]]; then # Path exists but is not a symlink
+    _error "make-symlink: '$_link_path' exists and is not a symlink"; return 1
+  fi
+
+  # Create parent directory for the link_path if needed
+  if [[ ! -d "$_link_parent_dir" ]]; then
+    local -a md_opts=()
+    # If -p was passed to make-symlink, also pass it to loam.make-dir for parent creation,
+    # assuming loam.make-dir's -p implies setting ownership to real user.
+    $_chown_link_flag && md_opts+=(-p)
+    loam.make-dir "${md_opts[@]}" "$_link_parent_dir" || { _error "make-symlink: failed to create parent '$_link_parent_dir'"; return 1; }
+  fi
+
+  # Create the symlink (as current user).
+  # If _link_path is in a privileged location (e.g. /usr/local/bin not writable by user), this will fail.
+  # This function does not use sudo for standard symlinks.
+  if ln -sfn "$_source_path" "$_link_path"; then
+    _log "symlink created: '$_link_path' -> '$_source_path'"
+    $_chown_link_flag && loam.set-real-owner "$_link_path" # chowns the link itself
+    return 0
+  else
+    _error "make-symlink: failed to create symlink '$_link_path' (check permissions for '$_link_parent_dir'?)"; return 1
+  fi
+}
+
+# info: creates root link (linux:/name->path) or synthetic mount (macos:/etc/synthetic.conf)
+# usage: make-root-symlink [-r (set linux symlink owner to real user)] <link_name> <abs_target_path>
+loam.make-root-symlink() {
+  local _set_real_owner_flag=false
+  
+  local OPTIND opt
+  while getopts "rh" opt; do # -r for "real owner"
+    case $opt in
+      r) _set_real_owner_flag=true ;;
+      *) echo "usage: make-root-symlink [-r] <link_name_at_root> <absolute_target_path>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  local _link_name="${1-}"    # e.g., "data"
+  local _target_path="${2-}"  # e.g., "/Users/Shared/Data", MUST be absolute
+  
+  local _root_path_to_create # e.g., "/data"
+  local _current_os=$(os)
+
+  if [[ -z "$_link_name" || -z "$_target_path" ]]; then echo "usage: make-root-symlink [-r] <link_name_at_root> <absolute_target_path>" >&2; return $_E_USG; fi
+  if [[ "$_target_path" != /* ]]; then _error "make-root-symlink: target path '$_target_path' must be absolute"; return 1; fi
+  if [[ "$_link_name" == */* || "$_link_name" == "." || "$_link_name" == ".." || -z "$_link_name" ]]; then
+    _error "make-root-symlink: link name '$_link_name' is invalid"; return 1
+  fi
+
+  _root_path_to_create="/$_link_name"
+  _log "ensure '$_root_path_to_create' -> '$_target_path' (os: $_current_os)"
+
+  if [[ "$_current_os" == "mac" ]]; then
+    # The -r flag (set real owner) is ignored for macOS synthetic mounts as their apparent
+    # ownership in '/' is managed by the system and not directly chownable.
+    # Ownership of the actual _target_path directory is what matters.
+    $_set_real_owner_flag && _warn "make-root-symlink: -r flag ignored for macos synthetic mount '$_root_path_to_create'"
+
+    local synthetic_conf="/etc/synthetic.conf"
+    if ! sudo test -e "$synthetic_conf"; then
+      _log "creating $synthetic_conf"
+      { sudo touch "$synthetic_conf" && sudo chmod 644 "$synthetic_conf"; } || { _error "failed to create/permission $synthetic_conf"; return 1; }
+    fi
+
+    # Check if link_name is already configured and correct
+    # Uses awk to extract the target path (second field onwards) from the matching line
+    # `tr -d '\n'` removes trailing newline from awk, `xargs` trims whitespace.
+    local _existing_target
+    _existing_target=$(sudo grep -E "^${_link_name}[[:space:]\t]+" "$synthetic_conf" 2>/dev/null | head -n1 | awk '{sub($1"[ \t]*",""); print $0}' | tr -d '\n' | xargs)
+
+    if [[ -n "$_existing_target" ]]; then # Entry found
+      # Normalize both paths for comparison (synthetic.conf format is without leading slash)
+      local _normalized_target="${_target_path#/}"
+      if [[ "$_existing_target" == "$_normalized_target" ]]; then
+        _log "synthetic mount '$_root_path_to_create' -> '$_target_path' already correct"
+        return 0
+      else
+        _error "synthetic mount '$_root_path_to_create' in $synthetic_conf points to '$_existing_target' (expected '$_normalized_target'). manual review needed"
+        return 1
+      fi
+    else # Entry not found, add it
+      _log "adding synthetic mount '$_root_path_to_create' -> '$_target_path' to $synthetic_conf"
+      # Strip leading slash from target path for synthetic.conf format
+      local _synthetic_target="${_target_path#/}"
+      if echo -e "${_link_name}\t${_synthetic_target}" | sudo tee -a "$synthetic_conf" >/dev/null; then
+         _log "synthetic mount point added. reboot required for '$_root_path_to_create' to appear"
+      else
+        _error "failed to write to $synthetic_conf"; return 1
+      fi
+    fi
+  elif [[ "$_current_os" == "linux" ]]; then
+    if [[ "$_root_path_to_create" == "$_target_path" ]]; then _log "skip symlink: '$_root_path_to_create' would be self-referential"; return 0; fi
+
+    if [[ -L "$_root_path_to_create" ]]; then # Symlink exists
+      if [[ "$(readlink "$_root_path_to_create")" == "$_target_path" ]]; then
+        _log "symlink '$_root_path_to_create' -> '$_target_path' already correct"
+      else
+        _log "updating symlink '$_root_path_to_create' to point to '$_target_path'"
+        sudo ln -sfn "$_target_path" "$_root_path_to_create" || { _error "failed to update symlink"; return 1; }
+      fi
+    elif [[ -e "$_root_path_to_create" ]]; then # Path exists but is not a symlink
+      _error "cannot create symlink: '$_root_path_to_create' exists and is not a symlink"; return 1
+    else # Path does not exist, create symlink
+      _log "creating symlink '$_root_path_to_create' -> '$_target_path'"
+      sudo ln -sfn "$_target_path" "$_root_path_to_create" || { _error "failed to create symlink"; return 1; }
+    fi
+
+    # If -r flag, set ownership of the symlink itself to the real user (after sudo ln created it as root)
+    if $_set_real_owner_flag; then
+      _log "setting ownership of symlink '$_root_path_to_create' to real user"
+      # loam.set-real-owner uses `chown -h` for symlinks and handles sudo if needed.
+      if ! loam.set-real-owner "$_root_path_to_create"; then
+        _warn "failed to set ownership on root symlink '$_root_path_to_create'"
+      fi
+    fi
+  else
+    _warn "unsupported operating system: $_current_os"; return $_E_OS
+  fi
+  return 0
+}
+
+# info: create or update a file with permission handling
+# usage: make-touch [-p set ownership to the real user (when using sudo)] <file_path>
+loam.make-touch() {
+  local _chown=false
+  
+  local OPTIND opt
+  while getopts "ph" opt; do
+    case $opt in
+      p) _chown=true ;;
+      *) echo "usage: make-touch [-p set ownership to the real user (when using sudo)] <file_path>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND-1))
+  
+  # Get the file path
+  local _file_path="${1-}"
+  if [[ -z "$_file_path" ]]; then echo "usage: make-touch [-p set ownership to the real user (when using sudo)] <file_path>" >&2; return $_E_USG; fi
+  
+  # Create parent directory if needed
+  local _parent_dir="$(dirname "$_file_path")"
+  if [[ ! -d "$_parent_dir" ]]; then
+    loam.make-dir "$_parent_dir" || return 1
+  fi
+  
+  # Create or update the file
+  if touch "$_file_path"; then
+    $_chown && loam.set-real-owner "$_file_path"; return 0
+  else
+    _error "failed to create or update file $_file_path"; return 1
+  fi
+}
+
+# info: create a timestamped, one-time backup of a file or directory before a destructive write.
+#       NOT a versioning mechanism - just a machine-local safety copy.
+# usage: make-backup <file_or_directory> [backup_dir]
+loam.make-backup() {
+  local OPTIND; getopts "h" _ && { echo "usage: make-backup <file_or_directory> [backup_dir]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _file="${1-}"
+  local _bakdir="${2-}"
+  if [[ -z "$_file" ]]; then echo "usage: make-backup <file_or_directory> [backup_dir]"; return 1; fi
+  if [[ ! -e "$_file" ]]; then _error "not found: $_file"; return $_E_NF; fi
+
+  local _backup_name
+  if [[ -n "$_bakdir" ]]; then
+    loam.make-dir -q "$_bakdir" || { _error "failed to create backup directory: $_bakdir"; return 1; }
+    _backup_name="${_bakdir%/}/$(basename "$_file")_$(date +%Y%m%d-%H%M%S).bak"
+  else
+    _backup_name="${_file}_$(date +%Y%m%d-%H%M%S).bak"
+  fi
+
+  if cp -a "$_file" "$_backup_name"; then
+    echo "$_backup_name"; return 0
+  else
+    _error "failed to create backup of $_file"; return 1
+  fi
+}
+
+# info: create temporary directory with optional prefix
+# usage: temp-dir [prefix]
+loam.temp-dir() {
+  local OPTIND; getopts "h" _ && { echo "usage: temp-dir [prefix]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _prefix="${1:-$(loam.str-timestamp file)}"
+  
+  # Check if mktemp is available
+  if ! command -v mktemp &>/dev/null; then
+    # Fallback: create directory manually
+    local _temp_base="${TMPDIR:-/tmp}"
+    local _temp_dir="$_temp_base/${_prefix}_$$_$(date +%s)"
+    if mkdir -p "$_temp_dir" 2>/dev/null; then
+      echo "$_temp_dir"
+      return 0
+    else
+      _error "failed to create temporary directory (no mktemp available)"; return 1
+    fi
+  fi
+  
+  # Try BSD/macOS style first, then GNU style
+  if mktemp -d -t "$_prefix" 2>/dev/null; then
+    return 0
+  elif mktemp -d --tmpdir -t "${_prefix}.XXXXXX" 2>/dev/null; then
+    return 0
+  else
+    _error "failed to create temporary directory"; return 1
+  fi
+}
+
+# info: create temporary file with optional prefix and extension  
+# usage: temp-file [prefix] [extension]
+loam.temp-file() {
+  local OPTIND; getopts "h" _ && { echo "usage: temp-file [prefix] [extension]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _prefix="${1:-$(loam.str-timestamp file)}"
+  local _extension="${2:-tmp}"
+  
+  # Check if mktemp is available
+  if ! command -v mktemp &>/dev/null; then
+    # Fallback: create file manually
+    local _temp_base="${TMPDIR:-/tmp}"
+    local _temp_file="$_temp_base/${_prefix}_$$_$(date +%s).${_extension}"
+    if touch "$_temp_file" 2>/dev/null; then
+      echo "$_temp_file"
+      return 0
+    else
+      _error "failed to create temporary file (no mktemp available)"; return 1
+    fi
+  fi
+  
+  # Create temp file with prefix only, then append extension
+  local _temp_file
+  if _temp_file=$(mktemp -t "$_prefix" 2>/dev/null); then
+    local _final_file="${_temp_file}.${_extension}"
+    if mv "$_temp_file" "$_final_file" 2>/dev/null; then
+      echo "$_final_file"
+      return 0
+    else
+      rm -f "$_temp_file" 2>/dev/null
+      _error "failed to rename temporary file with extension"; return 1
+    fi
+  elif _temp_file=$(mktemp --tmpdir -t "${_prefix}.XXXXXX" 2>/dev/null); then
+    local _final_file="${_temp_file}.${_extension}"
+    if mv "$_temp_file" "$_final_file" 2>/dev/null; then
+      echo "$_final_file"
+      return 0
+    else
+      rm -f "$_temp_file" 2>/dev/null
+      _error "failed to rename temporary file with extension"; return 1
+    fi
+  else
+    _error "failed to create temporary file"; return 1
+  fi
+}
+
+# info: move file or directory to temporary location with optional prefix and extension
+# usage: temp-move <target> [prefix] [extension]
+loam.temp-move() {
+  local OPTIND; getopts "h" _ && { echo "usage: temp-move <target> [prefix] [extension]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _target="${1-}"
+  local _prefix="${2:-$(basename "$_target")}"
+  local _extension="${3-}"
+	 
+  if [[ -z "$_target" ]]; then
+    echo "usage: temp-move <target> [prefix] [extension]" >&2; return $_E_USG
+  fi
+  
+  if [[ ! -e "$_target" ]]; then
+    _warn "target does not exist: $_target"; return 1
+  fi
+  
+  # Determine extension and target type
+  local _is_directory=false
+  if [[ -d "$_target" ]]; then
+    _is_directory=true
+    _extension="${_extension:-dir}"
+  else
+    # Extract original extension from filename, fallback to 'bak'
+    if [[ -z "$_extension" ]]; then
+      local _basename=$(basename "$_target")
+      if [[ "$_basename" == *.* ]]; then
+        _extension="${_basename##*.}"
+        # Remove extension from prefix to avoid duplication
+        _prefix="${_prefix%.*}"
+      else
+        _extension="bak"
+      fi
+    fi
+  fi
+  
+  # Generate temp path (but don't create the file/directory yet)
+  local _temp_base
+  _temp_base=$(loam.temp-file "$_prefix" "$_extension") || {
+    _error "failed to generate temporary path"; return 1
+  }
+  
+  # Remove the temp file that was created (we just needed the path)
+  rm -f "$_temp_base" 2>/dev/null
+  
+  # Move target to temp location
+  if mv "$_target" "$_temp_base" 2>/dev/null; then
+    if $_is_directory; then
+      _log "directory moved to: $_temp_base"
+    else
+      _log "file moved to: $_temp_base"
+    fi
+    echo "$_temp_base"
+    return 0
+  else
+    _error "failed to move target to temporary location"; return 1
+  fi
+}
+
+# info: get file checksum
+# usage: get-checksum <file>
+loam.get-checksum() {
+  local OPTIND; getopts "h" _ && { echo "usage: get-checksum <file>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _file="${1-}"
+
+  if [[ -z "$_file" ]]; then echo "usage: get-checksum <file>" >&2; return $_E_USG; fi
+  if [[ ! -f "$_file" ]]; then _error "not found: $_file"; return $_E_NF; fi
+
+  # Get file hash using available tool
+  if command -v shasum &>/dev/null; then
+    _actual=$(shasum -a 256 -- "$_file" | cut -d' ' -f1)
+  elif command -v sha256sum &>/dev/null; then
+    _actual=$(sha256sum -- "$_file" | cut -d' ' -f1)
+  else
+    _error "checksum verification unavailable: neither shasum nor sha256sum found"; return $_E_DEP
+  fi
+  echo "$_actual"
+}
+
+# info: verify file checksum against expected SHA256
+# usage: verify-checksum <file> <expected_sha256>
+loam.verify-checksum() {
+  local OPTIND; getopts "h" _ && { echo "usage: verify-checksum <file> <expected_sha256>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _file="${1-}"
+  local _expected="${2-}"
+  local _actual _actual_lower _expected_lower
+
+  if [[ -z "$_file" || -z "$_expected" ]]; then echo "usage: verify-checksum <file> <expected_sha256>" >&2; return $_E_USG; fi
+  if [[ ! -f "$_file" ]]; then _error "not found: $_file"; return $_E_NF; fi
+
+  # Get file hash using available tool
+  if command -v shasum &>/dev/null; then
+    _actual=$(shasum -a 256 -- "$_file" | cut -d' ' -f1)
+  elif command -v sha256sum &>/dev/null; then
+    _actual=$(sha256sum -- "$_file" | cut -d' ' -f1)
+  else
+    _error "checksum verification unavailable: neither shasum nor sha256sum found"; return $_E_DEP
+  fi
+
+  if [[ -z "$_actual" ]]; then _error "failed to calculate checksum for $_file"; return 1; fi
+
+  # Convert to lowercase for case-insensitive comparison (portable)
+  _actual_lower=$(echo "$_actual" | tr '[:upper:]' '[:lower:]')
+  _expected_lower=$(echo "$_expected" | tr '[:upper:]' '[:lower:]')
+
+  if [[ "$_actual_lower" == "$_expected_lower" ]]; then
+    _log "checksum matched"
+    return 0
+  else
+    _error "checksum mismatch for '$_file' - expected: $_expected | actual: $_actual"; 
+	return 1
+  fi
+}
+
+# info: get file type (mime)
+# usage: get-filetype <file>
+loam.get-filetype() {
+  local OPTIND; getopts "h" _ && { echo "usage: get-filetype <file>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _file="${1-}"
+
+  if [[ -z "$_file" ]]; then echo "usage: get-filetype <file>" >&2; return $_E_USG; fi
+  if [[ ! -f "$_file" ]]; then _error "not found: $_file"; return $_E_NF; fi
+
+  # Get file type using available tool
+  if command -v file &>/dev/null; then
+    file -b --mime-type "$_file" 2>/dev/null
+  else
+    _error "file type detection unavailable: file command not found"; return $_E_DEP
+  fi
+}
+
+# info: remove macOS quarantine attribute from files/directories
+# usage: remove-quarantine <path> [path...]
+loam.remove-quarantine() {
+  local OPTIND; getopts "h" _ && { echo "usage: remove-quarantine <path> [path...]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  if [[ $# -eq 0 ]]; then
+    echo "usage: remove-quarantine <path> [path...]" >&2
+    return $_E_USG
+  fi
+
+  local _os
+  _os=$(os)
+
+  case "$_os" in
+    mac)
+      command -v xattr &>/dev/null || { _error "xattr command not found"; return $_E_DEP; } # Check if xattr command is available
+      local _path _removed_count=0 _total_count=0
+      
+      for _path in "$@"; do
+        ((_total_count++))
+        
+        if [[ ! -e "$_path" ]]; then
+          _warn "path does not exist: $_path"
+          continue
+        fi
+        
+        # Check if quarantine attribute exists
+        if xattr -p com.apple.quarantine "$_path" &>/dev/null; then
+          _log "removing quarantine from: $_path"
+          if xattr -r -d com.apple.quarantine "$_path" 2>/dev/null; then
+            ((_removed_count++))
+          else
+            _warn "failed to remove quarantine from: $_path"
+          fi
+        else
+          _log "no quarantine attribute found: $_path"
+        fi
+      done
+      _log "processed $_total_count item(s), removed quarantine from $_removed_count item(s)"; return 0
+      ;;
+    linux|win) _log "quarantine removal not needed on $_os"; return 0 ;;
+    *) _error "unsupported operating system: $_os"; return $_E_OS ;;
+  esac
+}
+
+# info: install application from DMG file on macOS
+# usage: install-dmg <dmg_file> [app_name] [location]
+loam.install-dmg() {
+  local OPTIND; getopts "h" _ && { echo "usage: install-dmg <dmg_file> [app_name] [location]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _dmg_file="${1-}" _app_name="${2-}" _install_location="${3:-/Applications}"
+
+  [[ -z "$_dmg_file" ]] && { echo "usage: install-dmg <dmg_file> [app_name] [location]" >&2; return $_E_USG; }
+  [[ "$(os)" != "mac" ]] && { _error "install-dmg is only supported on macOS"; return $_E_OS; }
+  [[ ! -f "$_dmg_file" ]] && { _error "DMG file not found: $_dmg_file"; return $_E_NF; }
+  command -v diskutil &>/dev/null || { _error "diskutil command not found"; return $_E_DEP; }
+
+  _log "mounting DMG: $_dmg_file"
+  
+  # Mount the DMG and capture the mount point
+  local _mount_output _mount_point _device
+  _mount_output=$(diskutil image attach "$_dmg_file" --mountOptions nobrowse 2>/dev/null) || { _error "failed to mount DMG: $_dmg_file"; return 1; }
+  
+  _debug "diskutil output: $_mount_output"
+  
+  # Extract mount point from diskutil output, handling spaces properly
+  _mount_point=$(echo "$_mount_output" | grep '/Volumes/' | tail -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^\/Volumes\//) {for(j=i;j<=NF;j++) printf "%s%s", $j, (j==NF?"\n":" ")}}')
+  _device=$(echo "$_mount_output" | head -1 | awk '{print $1}')
+  
+  _debug "parsed mount point: '$_mount_point'"
+  _debug "parsed device: '$_device'"
+  
+  [[ -z "$_mount_point" || ! -d "$_mount_point" ]] && { _error "failed to determine mount point for DMG"; return 1; }
+  _log "DMG mounted at: $_mount_point"
+  
+  # Find .app bundle to install
+  local _app_bundle
+  if [[ -n "$_app_name" ]]; then
+    _app_bundle="$_mount_point/$_app_name"
+    [[ ! -d "$_app_bundle" ]] && _app_bundle="$_mount_point/${_app_name}.app"
+  else
+    _app_bundle=$(find "$_mount_point" -name "*.app" -type d | head -1)
+  fi
+  
+  if [[ -z "$_app_bundle" || ! -d "$_app_bundle" ]]; then
+    _error "no .app bundle found in DMG"
+    diskutil unmount "$_mount_point" >/dev/null 2>&1 || true
+    return 1
+  fi
+  
+  local _app_basename=$(basename "$_app_bundle")
+  local _target_path="$_install_location/$_app_basename"
+  _log "installing: $_app_basename -> $_install_location"
+  _debug "app bundle found: '$_app_bundle'"
+  _debug "app basename: '$_app_basename'"
+  _debug "target path: '$_target_path'"
+  
+  # Create install location if needed
+  if [[ ! -d "$_install_location" ]]; then
+    if [[ "$_install_location" == /Applications* || "$_install_location" == /usr/* ]]; then
+      loam.make-dir -s -p "$_install_location" || { _error "failed to create install directory: $_install_location"; diskutil unmount "$_mount_point" >/dev/null 2>&1 || true; return 1; }
+    else
+      loam.make-dir -p "$_install_location" || { _error "failed to create install directory: $_install_location"; diskutil unmount "$_mount_point" >/dev/null 2>&1 || true; return 1; }
+    fi
+  fi
+  
+  # Remove existing app if present
+  if [[ -e "$_target_path" ]]; then
+    _warn "removing existing application: $_target_path"
+    if [[ "$_install_location" == /Applications* || "$_install_location" == /usr/* ]]; then
+      sudo rm -rf "$_target_path" || { _error "failed to remove existing application: $_target_path"; diskutil unmount "$_mount_point" >/dev/null 2>&1 || true; return 1; }
+    else
+      rm -rf "$_target_path" || { _error "failed to remove existing application: $_target_path"; diskutil unmount "$_mount_point" >/dev/null 2>&1 || true; return 1; }
+    fi
+  fi
+  
+  # Copy the application
+  if [[ "$_install_location" == /Applications* || "$_install_location" == /usr/* ]]; then
+    sudo cp -R "$_app_bundle" "$_install_location/" || { _error "failed to copy application to $_install_location"; diskutil unmount "$_mount_point" >/dev/null 2>&1 || true; return 1; }
+    loam.set-real-owner -s "$_target_path" || _warn "could not set ownership for $_target_path"
+  else
+    cp -R "$_app_bundle" "$_install_location/" || { _error "failed to copy application to $_install_location"; diskutil unmount "$_mount_point" >/dev/null 2>&1 || true; return 1; }
+  fi
+  
+  loam.remove-quarantine "$_target_path" || _warn "could not remove quarantine from $_target_path"
+  
+  _log "unmounting DMG"
+  diskutil unmount "$_mount_point" >/dev/null 2>&1 || _warn "failed to cleanly unmount DMG"
+  
+  _log "successfully installed: $_app_basename in $_install_location"
+  echo "$_target_path"
+  return 0
+}
+
+# info: move file or directory to trash (macOS Trash or Linux XDG Trash)
+# usage: trash <path> [path...]
+loam.trash() {
+  local OPTIND; getopts "h" _ && { echo "usage: trash <path> [path...]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  [[ $# -eq 0 ]] && { echo "usage: trash <path> [path...]" >&2; return $_E_USG; }
+  
+  local _os_type; _os_type="$(os)"
+  local _trash_dir=""
+  
+  # Determine trash directory based on OS
+  case "$_os_type" in
+    mac)
+      _trash_dir="$HOME/.Trash"
+      ;;
+    linux)
+      _trash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Trash/files"
+      ;;
+    *)
+      _trash_dir="$HOME/.trash"
+      ;;
+  esac
+  
+  # Create trash directory if it doesn't exist
+  [[ ! -d "$_trash_dir" ]] && mkdir -p "$_trash_dir"
+  
+  local _path _trashed_count=0 _total_count=0
+  for _path in "$@"; do
+    ((_total_count++))
+    
+    [[ ! -e "$_path" ]] && { _warn "path not found: $_path"; continue; }
+    
+    local _basename="$(basename "$_path")"
+    local _trash_target="$_trash_dir/$_basename"
+    
+    # Handle name conflicts by appending counter
+    local _counter=1
+    while [[ -e "$_trash_target" ]]; do
+      local _name="${_basename%.*}"
+      local _ext="${_basename##*.}"
+      if [[ "$_name" == "$_ext" ]]; then
+        # No extension
+        _trash_target="$_trash_dir/${_basename}_${_counter}"
+      else
+        # Has extension
+        _trash_target="$_trash_dir/${_name}_${_counter}.${_ext}"
+      fi
+      ((_counter++))
+    done
+    
+    # Move to trash
+    if mv "$_path" "$_trash_target" 2>/dev/null; then
+      _log "moved to trash: $_path"
+      ((_trashed_count++))
+    else
+      _warn "failed to move to trash: $_path"
+    fi
+  done
+  
+  [[ $_trashed_count -gt 0 ]] && _log "successfully trashed $_trashed_count of $_total_count item(s)"
+  return 0
+}
+##] filesystem
+
+##[ filesystem-search
+
+# info: check if a file or directory is binary (non-text)
+# usage: is-binary <file_or_directory>
+loam.is_binary() {
+  local OPTIND; getopts "h" _ && { echo "usage: is-binary <file_or_directory>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _target="${1-}"
+
+  if [[ -z "$_target" ]]; then echo "usage: is-binary <file_or_directory>" >&2; return $_E_USG; fi
+  if [[ ! -e "$_target" ]]; then _error "not found: $_target"; return $_E_NF; fi
+  if [[ ! -r "$_target" ]]; then _error "permission denied: cannot read '$_target'"; return $_E_NP; fi
+  if [[ -d "$_target" ]]; then return 0; fi  # directories are binary
+  if [[ ! -f "$_target" ]]; then return 0; fi  # special files are binary
+  if [[ ! -s "$_target" ]]; then return 1; fi  # empty files are text
+
+  # Try multiple approaches for better compatibility
+  if command -v file >/dev/null 2>&1; then
+    # Modern file command with MIME type
+    if file -b --mime-type "$_target" 2>/dev/null | grep -q "^text/"; then
+      return 1  # text
+    fi
+    
+    # Check for specific text types that might not have text/ MIME type
+    local _file_output
+    _file_output=$(file -b "$_target" 2>/dev/null)
+    if echo "$_file_output" | grep -qi "text\|script\|source\|xml\|json\|yaml\|configuration"; then
+      return 1  # text
+    fi
+  fi
+
+  # Ultimate fallback: check for null bytes in first 8192 bytes
+  if LC_ALL=C head -c 8192 "$_target" 2>/dev/null | LC_ALL=C grep -qv $'\0'; then
+    return 1  # text
+  fi
+
+  return 0  # binary
+}
+
+# info: find files in directory with pattern matching and exclusion options
+# usage: find-files [-p pattern] [-n] [-b] [-i] [-a] [-l] [-e exclude_dir] [-x exclude_file] [directory]
+loam.find-files() {
+  local _dir="."
+  local _exclude_hidden=false
+  local _exclude_binary=false
+  local _ignore_case=false
+  local _absolute_path=false
+  local _exclude_links=false
+  local -a _patterns=()
+  local _has_patterns=false
+  local -a _ex_dirs=()
+  local -a _ex_files=()
+  local -a _pos_args=()
+
+  command -v find &>/dev/null || { _error "find command not found"; return $_E_DEP; }
+
+  # Parse options
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -p|--pattern)
+        if [[ -z ${2-} ]]; then _error "-p/--pattern requires an argument"; return $_E_USG; fi
+        _patterns+=("$2")
+        _has_patterns=true
+        shift 2
+        ;;
+      -n|--no-hidden) _exclude_hidden=true; shift ;;
+      -b|--no-binary) _exclude_binary=true; shift ;;
+      -i|--ignore-case) _ignore_case=true; shift ;;
+      -a|--absolute) _absolute_path=true; shift ;;
+      -l|--no-links) _exclude_links=true; shift ;;
+      -e|--exclude-dir)
+        if [[ -z ${2-} ]]; then _error "-e/--exclude-dir requires an argument"; return $_E_USG; fi
+        _ex_dirs+=("$2")
+        shift 2
+        ;;
+      -x|--exclude-file)
+        if [[ -z ${2-} ]]; then _error "-x/--exclude-file requires an argument"; return $_E_USG; fi
+        _ex_files+=("$2")
+        shift 2
+        ;;
+      -h|--help)
+        echo "usage: find-files [-p pattern] [-n] [-b] [-i] [-a] [-l] [-e exclude_dir] [-x exclude_file] [directory]" >&2
+        sed -n '/^##sec-start-help-find-files/,/^##sec-end-help-find-files/p' "$_RPATH" | sed '1d;$d'
+        return $_E_USG
+        ;;
+      -*)
+        _error "unknown option $1"
+        echo "usage: find-files [-p pattern] [-n] [-b] [-i] [-a] [-l] [-e exclude_dir] [-x exclude_file] [directory]" >&2
+        return $_E_USG
+        ;;
+      *) _pos_args+=("$1"); shift ;;
+    esac
+  done
+
+  # If no patterns specified, use default "*"
+  if [[ "$_has_patterns" == false ]]; then _patterns=("*"); fi
+
+  # Process positional arguments
+  if [[ ${#_pos_args[@]} -eq 1 ]]; then
+    _dir="${_pos_args[0]}"
+  elif [[ ${#_pos_args[@]} -gt 1 ]]; then
+    _error "too many arguments"; return $_E_USG
+  fi
+
+  # Validate directory
+  if [[ ! -e "$_dir" ]]; then _error "directory not found: '$_dir'"; return $_E_NF; fi
+  if [[ ! -d "$_dir" ]]; then _error "'$_dir' is not a directory"; return $_E_USG; fi
+  if [[ ! -r "$_dir" ]]; then _error "permission denied: cannot read directory '$_dir'"; return $_E_NP; fi
+
+  # Convert to absolute path if requested
+  if [[ "$_absolute_path" == true ]]; then
+    _dir=$(cd "$_dir" 2>/dev/null && pwd) || {
+      _error "failed to resolve absolute path for '$_dir'"
+      return $_E_NF
+    }
+  fi
+
+  # Declare loop variables outside loops
+  local _pattern _ex_dir _ex_file _line _file
+
+  # Build find command for each pattern
+  local -a _results=()
+  
+  for _pattern in "${_patterns[@]}"; do
+    local -a _opts=("$_dir" "-type" "f")
+
+    # Add case sensitivity option
+    if [[ "$_ignore_case" == true ]]; then
+      _opts+=("-iname" "$_pattern")
+    else
+      _opts+=("-name" "$_pattern")
+    fi
+
+    # Exclude symbolic links if requested
+    if [[ "$_exclude_links" == true ]]; then _opts+=("!" "-type" "l"); fi
+
+    # Add directory exclusions
+    if [[ ${#_ex_dirs[@]} -gt 0 ]]; then
+      for _ex_dir in "${_ex_dirs[@]}"; do
+        _opts+=("-not" "-path" "*/$_ex_dir/*")
+      done
+    fi
+
+    # Add file exclusions
+    if [[ ${#_ex_files[@]} -gt 0 ]]; then
+      for _ex_file in "${_ex_files[@]}"; do
+        if [[ "$_ignore_case" == true ]]; then
+          _opts+=("-not" "-iname" "$_ex_file")
+        else
+          _opts+=("-not" "-name" "$_ex_file")
+        fi
+      done
+    fi
+
+    # Add hidden file/directory exclusions
+    if [[ "$_exclude_hidden" == true ]]; then _opts+=("-not" "-path" "*/.*"); fi
+
+    # Add reasonable depth limit to prevent infinite loops
+    _opts+=("-maxdepth" "50")
+
+    # Debug output
+    _debug find "${_opts[@]}"
+
+    # Execute and collect results
+    while IFS= read -r _line; do
+      [[ -n "$_line" ]] && _results+=("$_line")
+    done < <(find "${_opts[@]}" 2>/dev/null)
+  done
+
+  # Filter binary files if requested
+  if [[ "$_exclude_binary" == true ]]; then
+    local -a _filtered_results=()
+    for _file in "${_results[@]}"; do
+      if [[ -n "$_file" ]] && ! loam.is_binary "$_file"; then
+        _filtered_results+=("$_file")
+      fi
+    done
+    _results=("${_filtered_results[@]}")
+  fi
+
+  # Convert to relative paths if absolute not requested and we're not in the target dir
+  if [[ "$_absolute_path" == false ]] && [[ "$_dir" == /* ]]; then
+    local -a _relative_results=()
+    local _pwd
+    _pwd=$(pwd)
+    for _file in "${_results[@]}"; do
+      # Convert absolute path to relative if possible
+      if [[ "$_file" == "$_pwd"/* ]]; then
+        _relative_results+=("${_file#"$_pwd"/}")
+      else
+        _relative_results+=("$_file")
+      fi
+    done
+    _results=("${_relative_results[@]}")
+  fi
+
+  # Sort and deduplicate results
+  printf '%s\n' "${_results[@]}" | sort -u
+
+  return 0
+}
+#++++++++++++++++++++++++++++++++++++++
+##sec-start-help-find-files
+# Examples:
+#
+# Basic file finding (includes hidden files and binary files by default):
+#   find-files "/home/user"
+#   find-files "."
+#
+# Find specific patterns:
+#   find-files -p "*.txt" "/documents"
+#   find-files -p "*.log" -p "*.err" "/var/log"
+#   find-files -p "*.js" -p "*.ts" "/project/src"
+#
+# Case-insensitive pattern matching:
+#   find-files -i -p "*.TXT" "/documents"
+#   find-files -i -p "readme*" "/project"
+#
+# Get absolute paths:
+#   find-files -a -p "*.conf" "/etc"
+#   find-files -a "/home/user"
+#
+# Exclude hidden files:
+#   find-files -n -p "*.conf" "/etc"
+#   find-files -n "/home/user"
+#
+# Exclude binary files (text files only):
+#   find-files -b "/usr/bin"
+#   find-files -b -p "*.py" "/project"
+#
+# Exclude symbolic links:
+#   find-files -l "/usr/bin"
+#   find-files -l -p "*.sh" "/scripts"
+#
+# Exclude both hidden and binary files:
+#   find-files -n -b "/project/src"
+#
+# Exclude directories and files:
+#   find-files -e ".git" -e "node_modules" "/project"
+#   find-files -x "*.tmp" -x "*.bak" "/data"
+#   find-files -p "*.py" -e "__pycache__" -x "*.pyc" "/python-project"
+#
+# Complex combinations:
+#   find-files -n -b -i -a -l -p "*.conf" -p "*.cfg" -e ".git" -x "*.bak" "/etc"
+#   find-files -p "*.sh" -p "*.zsh" -n -e ".git" -x "*.tmp" "/scripts"
+##sec-end-help-find-files
+#++++++++++++++++++++++++++++++++++++++
+##] filesystem-search
+
+##[ archive
+
+# info: extract various archive types; prefers 'unar' if available
+# usage: extract <filename> [destination_directory (default=.)] -> always outputs the final extraction directory to stdout on success for scripting
+loam.extract() {
+  local OPTIND; getopts "h" _ && { echo "usage: extract <filename> [destination_directory (default=.)]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _file=${1-}
+  local _dest_dir="${2:-.}"
+  local _abs_dest # Will be set after directory creation
+
+  if [[ -z "$_file" ]]; then echo "usage: extract <filename> [destination_directory (default=.)]" >&2; return $_E_USG; fi
+  if [[ ! -f "$_file" ]]; then _error "not found: $_file"; return $_E_NF; fi
+
+  # Create destination directory if needed
+  if [[ ! -d "$_dest_dir" ]]; then
+    mkdir -p -- "$_dest_dir" || { _error "failed to create destination directory: $_dest_dir"; return 1; }
+  fi
+
+  # Get absolute path for reliable output and operations
+  if ! _abs_dest=$(cd -- "$_dest_dir" && pwd); then
+    _error "could not determine absolute path for destination: $_dest_dir"; return 1
+  fi
+
+  local _basename
+  _basename=$(basename "$_file")
+  local _extract_dir_guess=""
+
+  # Use unar if available (handles many formats and creates clean directories)
+  if command -v unar &>/dev/null; then
+    if unar -o "$_abs_dest" -- "$_file" >/dev/null 2>&1; then
+      # Try to guess the directory unar might have created
+      local _potential_dir_name
+      if [[ "$_basename" == *.tar.* && "${_basename%%.tar.*}" != "" ]]; then
+          _potential_dir_name="${_basename%%.tar.*}"
+      elif [[ "$_basename" == *"."* ]]; then
+          _potential_dir_name="${_basename%.*}"
+      else
+          _potential_dir_name="$_basename"
+      fi
+      _extract_dir_guess="$_abs_dest/$_potential_dir_name"
+
+      if [[ -d "$_extract_dir_guess" ]]; then
+        echo "$_extract_dir_guess"
+      else
+        echo "$_abs_dest"
+      fi
+      return 0
+    else
+      _error "unar failed to extract $_file"; return 1
+    fi
+  fi
+
+  # Convert filename to lowercase for case-insensitive matching (portable)
+  local _file_lower
+  _file_lower=$(echo "$_file" | tr '[:upper:]' '[:lower:]')
+
+  # Otherwise use format-specific extractors
+  case "$_file_lower" in
+    *.tar.bz2|*.tbz2)
+      tar xjf -- "$_file" -C "$_abs_dest" >/dev/null 2>&1 || { _error "failed to extract $_file"; return 1; }
+      echo "$_abs_dest"
+      ;;
+    *.tar.gz|*.tgz)
+      tar xzf -- "$_file" -C "$_abs_dest" >/dev/null 2>&1 || { _error "failed to extract $_file"; return 1; }
+      echo "$_abs_dest"
+      ;;
+    *.tar.xz|*.txz)
+      tar xJf -- "$_file" -C "$_abs_dest" >/dev/null 2>&1 || { _error "failed to extract $_file"; return 1; }
+      echo "$_abs_dest"
+      ;;
+    *.tar)
+      tar xf -- "$_file" -C "$_abs_dest" >/dev/null 2>&1 || { _error "failed to extract $_file"; return 1; }
+      echo "$_abs_dest"
+      ;;
+    *.zip)
+      unzip -q -- "$_file" -d "$_abs_dest" >/dev/null 2>&1 || { _error "failed to extract $_file"; return 1; }
+      # Try to determine if zip created a single top-level directory
+      local _potential_dir_name
+      if [[ "$_basename" == *.tar.* && "${_basename%%.tar.*}" != "" ]]; then
+          _potential_dir_name="${_basename%%.tar.*}"
+      elif [[ "$_basename" == *"."* ]]; then
+          _potential_dir_name="${_basename%.*}"
+      else
+          _potential_dir_name="$_basename"
+      fi
+      _extract_dir_guess="$_abs_dest/$_potential_dir_name"
+
+      if [[ -d "$_extract_dir_guess" ]]; then
+        echo "$_extract_dir_guess"
+      else
+        echo "$_abs_dest"
+      fi
+      ;;
+    *.7z)
+      if command -v 7z &>/dev/null; then
+        7z x -- "$_file" -o"$_abs_dest" -y >/dev/null 2>&1 || { _error "failed to extract $_file"; return 1; }
+        echo "$_abs_dest"
+      else
+        _error "7z command not found. To extract .7z, consider installing p7zip."; return $_E_DEP
+      fi ;;
+    *.rar)
+      if command -v unrar &>/dev/null; then
+        unrar x -y -- "$_file" "$_abs_dest/" >/dev/null 2>&1 || { _error "failed to extract $_file with unrar"; return 1; }
+        echo "$_abs_dest"
+      elif command -v rar &>/dev/null; then
+        rar x -y -- "$_file" "$_abs_dest/" >/dev/null 2>&1 || { _error "failed to extract $_file with rar"; return 1; }
+        echo "$_abs_dest"
+      else
+        _error "unrar or rar command not found. To extract .rar, consider installing unrar or p7zip-rar."; return $_E_DEP
+      fi ;;
+    *.deb)
+      if command -v dpkg &>/dev/null; then
+        dpkg -x -- "$_file" "$_abs_dest" >/dev/null 2>&1 || { _error "failed to extract $_file"; return 1; }
+        echo "$_abs_dest"
+      else
+        _error "dpkg not found. To extract .deb, consider installing dpkg."; return $_E_DEP
+      fi ;;
+    *.bz2|*.gz|*.Z|*.z)
+      (
+        cd -- "$_abs_dest" || { _error "failed to change to destination directory for decompression"; exit 1; }
+        cp -- "$OLDPWD/$_file" . || { _error "failed to copy $_file for decompression"; exit 1; }
+
+        local _target_basename
+        _target_basename=$(basename "$_file")
+
+        case "$_file_lower" in
+          *.bz2) bunzip2 -- "$_target_basename" >/dev/null 2>&1 || { _error "bunzip2 failed for $_target_basename"; exit 1; } ;;
+          *.gz)  gunzip -- "$_target_basename" >/dev/null 2>&1 || { _error "gunzip failed for $_target_basename"; exit 1; } ;;
+          *.Z|*.z) uncompress -- "$_target_basename" >/dev/null 2>&1 || { _error "uncompress failed for $_target_basename"; exit 1; } ;;
+        esac
+      ) || return 1
+      echo "$_abs_dest"
+      ;;
+    *.pkg) _error "cannot auto-extract .pkg. Use installer or open manually."; return 1 ;;
+    *) _error "'$_file' cannot be extracted by this function - install 'unar' for broader support or handle manually."; return 1 ;;
+  esac
+
+  return 0
+}
+
+# info: intelligently extract archive with optional item selection and executable permissions
+# usage: smart-extract [-s selector] [-f force_overwrite] [-x exec_pattern] <archive_file> [destination] -> returns final path
+loam.smart-extract() {
+  local _selector=""
+  local _force=false
+  local _exec_pattern=""
+  local _archive _dest _abs_dest
+
+  local OPTIND opt
+  while getopts "s:fx:h" opt; do
+    case $opt in
+      s) _selector="$OPTARG" ;;
+      f) _force=true ;;
+      x) _exec_pattern="$OPTARG" ;;
+      h) 
+	  echo "usage: smart-extract [-s selector] [-f force_overwrite] [-x exec_pattern] <archive_file> [destination]" >&2; 
+	  sed -n '/^##sec-start-help-smart-extract/,/^##sec-end-help-smart-extract/p' "$_RPATH" | sed '1d;$d'
+	  return $_E_USG
+	  ;;
+      *) 
+	  echo "usage: smart-extract [-s selector] [-f force_overwrite] [-x exec_pattern] <archive_file> [destination]" >&2; 
+	  sed -n '/^##sec-start-help-smart-extract/,/^##sec-end-help-smart-extract/p' "$_RPATH" | sed '1d;$d'
+	  return $_E_USG 
+	  ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  _archive=${1-}
+  _dest="${2:-.}"
+
+  if [[ -z "$_archive" ]]; then echo "usage: smart-extract [-s selector] [-f force_overwrite] [-x exec_pattern] <archive_file> [destination]" >&2; return $_E_USG; fi
+  if [[ ! -f "$_archive" ]]; then _error "smart-extract: archive not found: $_archive"; return $_E_NF; fi
+
+  # Create destination directory if needed
+  if ! loam.make-dir -q "$_dest"; then _error "smart-extract: failed to create destination directory: $_dest"; return 1; fi
+
+  # Get absolute path for destination
+  if ! _abs_dest=$(cd -- "$_dest" && pwd); then
+    _error "smart-extract: could not determine absolute path for destination: $_dest"
+    return 1
+  fi
+
+  # No selector - use regular extract
+  if [[ -z "$_selector" ]]; then
+    _log "smart-extract: extracting all contents to $_abs_dest"
+    local _extract_result
+    _extract_result=$(loam.extract "$_archive" "$_abs_dest") || return $?
+    
+    # Make files executable if -x pattern is provided
+    if [[ -n "$_exec_pattern" ]]; then
+      _log "smart-extract: making files matching '$_exec_pattern' executable"
+      find "$_extract_result" -type f -iname "$_exec_pattern" -exec chmod +x {} \; 2>/dev/null || _warn "no files found matching exec pattern '$_exec_pattern'"
+    fi
+    
+    echo "$_extract_result"
+    return 0
+  fi
+
+  # Selector mode - extract to temp, find matches, move to destination
+  local _temp_dir
+  _temp_dir=$(mktemp -d) || { _error "failed to create temporary directory"; return 1; }
+
+  _log "smart-extract: extracting to temporary location for selection"
+  local _extract_dir
+  if ! _extract_dir=$(loam.extract "$_archive" "$_temp_dir"); then
+    _error "smart-extract: failed to extract archive for selection"
+    rm -rf "$_temp_dir"
+    return 1
+  fi
+
+  # Find matches at root level of extracted contents (case-insensitive)
+  local -a _matches=()
+  local _item
+
+  _debug "smart-extract: extract returned: $_extract_dir, searching for: '$_selector'"
+
+  # Capture matches into array
+  while IFS= read -r -d '' _item; do
+    _matches+=("$_item")
+  done < <(find "$_extract_dir" -mindepth 1 -maxdepth 1 -iname "$_selector" -print0 2>/dev/null)
+
+  if [[ ${#_matches[@]} -eq 0 ]]; then
+    _debug "smart-extract: no matches found - directory contents:"
+    find "$_extract_dir" -mindepth 1 -maxdepth 1 2>/dev/null | while read -r item; do
+      _debug "  $(basename "$item")"
+    done
+    _error "smart-extract: no items found matching selector '$_selector' in archive"
+    rm -rf "$_temp_dir"
+    return 1
+  fi
+
+  _log "smart-extract: found ${#_matches[@]} item(s) matching '$_selector'"
+
+  # Move all matches to destination
+  local _moved_count=0
+  local -a _moved_items=()
+  for _item in "${_matches[@]}"; do
+    local _item_name=$(basename "$_item")
+    local _target_path="$_abs_dest/$_item_name"
+    
+    if [[ -e "$_target_path" ]]; then
+      if $_force; then
+        _warn "smart-extract: target already exists, removing: $_target_path"
+        rm -rf "$_target_path" || { _error "failed to remove existing target: $_target_path"; rm -rf "$_temp_dir"; return 1; }
+      else
+        _error "smart-extract: target already exists: $_target_path (use -f to force overwrite)"
+        rm -rf "$_temp_dir"
+        return 1
+      fi
+    fi
+
+    if mv "$_item" "$_target_path"; then
+      _log "smart-extract: moved $(basename "$_item") to $_abs_dest"
+      _moved_items+=("$_target_path")
+      ((_moved_count++))
+    else
+      _error "smart-extract: failed to move $_item to $_target_path"
+      rm -rf "$_temp_dir"
+      return 1
+    fi
+  done
+  
+  # Make files executable if -x pattern is provided
+  if [[ -n "$_exec_pattern" ]]; then
+    _log "smart-extract: making files matching '$_exec_pattern' executable"
+    for _item in "${_moved_items[@]}"; do
+      if [[ -f "$_item" ]]; then
+        # Check if the file itself matches the exec pattern
+        # shellcheck disable=SC2053 # intentional: _exec_pattern is a caller-supplied glob, not a literal to quote
+        if [[ "$(basename "$_item")" == $_exec_pattern ]] || [[ "$(basename "$_item")" =~ $_exec_pattern ]]; then
+          chmod +x "$_item" || _warn "failed to make executable: $_item"
+        fi
+      elif [[ -d "$_item" ]]; then
+        # Find files within the directory that match the exec pattern
+        find "$_item" -type f -iname "$_exec_pattern" -exec chmod +x {} \; 2>/dev/null
+      fi
+    done
+  fi
+
+  # Cleanup temp directory
+  rm -rf "$_temp_dir"
+
+  _log "smart-extract: successfully moved $_moved_count item(s) to $_abs_dest"
+  echo "$_abs_dest"
+  return 0
+}
+#++++++++++++++++++++++++++++++++++++++
+##sec-start-help-smart-extract
+# Examples:
+#
+# Basic extraction (extract all contents):
+#   smart-extract "archive.zip" "/project/"
+#   smart-extract "project.tar.gz" "."
+#
+# Extract specific files/directories:
+#   smart-extract -s "*.app" "software.zip" "/Applications/"
+#   smart-extract -s "kubectl" "kubernetes.tar.gz" "/usr/local/bin/"
+#   smart-extract -s "config" "app.zip" "/etc/myapp/"
+#
+# Extract with patterns:
+#   smart-extract -s "*.sh" "scripts.zip" "/usr/local/bin/"
+#   smart-extract -s "*.dylib" "libs.tar.gz" "/usr/local/lib/"
+#   smart-extract -s "bin*" "tools.zip" "/usr/local/bin/"
+#
+# Make specific files executable:
+#   smart-extract -s "install.sh" -x "install.sh" "installer.zip" "/tmp/"
+#   smart-extract -s "*.sh" -x "*.sh" "scripts.tar.gz" "/usr/local/bin/"
+#   smart-extract -x "kubectl" "kubernetes.tar.gz" "/usr/local/bin/"
+#
+# Make files executable with different patterns:
+#   smart-extract -s "tools" -x "bin/*" "toolkit.zip" "/usr/local/"
+#   smart-extract -s "MyApp.app" -x "Contents/MacOS/*" "app.zip" "/Applications/"
+#   smart-extract -x "*.sh" "scripts.zip" "/usr/local/bin/"
+#
+# Force overwrite existing files:
+#   smart-extract -f -s "myapp" "update.zip" "/usr/local/bin/"
+#   smart-extract -f "archive.zip" "/project/"
+#
+# Combined flags:
+#   smart-extract -f -s "deploy" -x "deploy" "release.tar.gz" "/opt/app/"
+#   smart-extract -s "*.sh" -f -x "*.sh" "scripts.tar.gz" "/usr/local/bin/"
+#
+# Case-insensitive matching:
+#   smart-extract -s "*.APP" "mac-software.zip" "/Applications/"
+#   smart-extract -s "readme*" "project.tar.gz" "."
+#
+# Multiple file extraction:
+#   smart-extract -s "*" "archive.zip" "/dest/"          # Extract all root-level items
+#   smart-extract -s "*.*" "files.zip" "/dest/"         # Extract files with extensions only
+#
+# Real-world scenarios:
+#   # Download and install kubectl (extract and make executable)
+#   smart-extract -s "kubectl" -x "kubectl" "kubernetes-client.tar.gz" "/usr/local/bin/"
+#   
+#   # Install macOS application
+#   smart-extract -s "*.app" "MyApp.dmg.zip" "/Applications/"
+#   
+#   # Extract shell scripts and make them executable
+#   smart-extract -s "*.sh" -x "*.sh" "dotfiles.tar.gz" "$HOME/.local/bin/"
+#   
+#   # Extract tools directory and make all binaries executable
+#   smart-extract -s "tools" -x "bin/*" "toolkit.tar.gz" "/usr/local/"
+#   
+#   # Extract installer and make specific file executable
+#   smart-extract -f -s "installer" -x "install" "software.zip" "/tmp/"
+##sec-end-help-smart-extract
+#++++++++++++++++++++++++++++++++++++++
+##] archive
+
+##[ network
+
+# info: displays the ip address of the system (or 127.0.0.1)
+# usage: get-ip
+loam.get-ip() {
+  local OPTIND; getopts "h" _ && { echo "usage: get-ip" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _ip
+
+  # Try modern ip command first (Linux)
+  if command -v ip &>/dev/null; then
+    # Method 1: IP used for default route (often the "main" external IP)
+    _ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+    if [[ -n "$_ip" && "$_ip" != "127.0.0.1" ]]; then echo "$_ip"; return 0; fi
+
+    # Method 2: Generic global IP from 'ip addr'
+    _ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -n1)
+    if [[ -n "$_ip" && "$_ip" != "127.0.0.1" ]]; then echo "$_ip"; return 0; fi
+  fi
+
+  # Try macOS specific commands
+  if [[ "$(uname)" == "Darwin" ]]; then
+    _ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+    if [[ -n "$_ip" ]]; then echo "$_ip"; return 0; fi
+
+    _ip=$(networksetup -getinfo Wi-Fi 2>/dev/null | awk '/^IP address:/{print $3}')
+    if [[ -n "$_ip" ]]; then echo "$_ip"; return 0; fi
+  fi
+
+  # Try ifconfig (fallback for macOS and Linux if 'ip' command failed or not present)
+  if command -v ifconfig &>/dev/null; then
+    _ip=$(ifconfig 2>/dev/null | grep "inet " | grep -Fv "127.0.0.1" | awk '{print $2}' | head -n1 | sed 's/addr://g' 2>/dev/null)
+    if [[ -n "$_ip" ]]; then echo "$_ip"; return 0; fi
+  fi
+
+  # Ultimate Fallback
+  echo "127.0.0.1"
+}
+
+# info: check if the system has internet connectivity
+# usage: is-online
+loam.is-online() {
+  local OPTIND; getopts "h" _ && { echo "usage: is-online" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  # Try ping first (fast ICMP check)
+  if [[ "$(uname)" == "Darwin" ]]; then # macOS ping
+    ping -c 1 -t 1 8.8.8.8 >/dev/null 2>&1 && return 0
+  else # Linux/other ping
+    ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1 && return 0
+  fi
+
+  # Try DNS resolution (nslookup)
+  if command -v nslookup &>/dev/null; then
+    nslookup google.com >/dev/null 2>&1 && return 0
+  fi
+  # Alternative DNS tools like 'dig' could also be added:
+  # if command -v dig &>/dev/null; then
+  #   dig +short +time=1 +tries=1 google.com @8.8.8.8 >/dev/null 2>&1 && return 0
+  # fi
+
+  # Try HTTP/S HEAD request (curl or wget)
+  if command -v curl &>/dev/null; then
+    # -f: fail on server errors (4xx, 5xx)
+    # -s: silent
+    # --connect-timeout: for connection phase
+    # --max-time: for the whole operation
+    curl -fsI --connect-timeout 2 --max-time 3 https://www.google.com >/dev/null 2>&1 && return 0
+  elif command -v wget &>/dev/null; then
+    # -q: quiet
+    # --timeout: overall response timeout
+    # --tries: number of retries
+    # -O /dev/null: discard output
+    # --no-check-certificate: can be useful if local cert store is an issue, but less secure
+    wget -qS --timeout=2 --tries=1 --spider https://www.google.com >/dev/null 2>&1 && return 0
+  fi
+
+  return $_E_NC
+}
+
+# info: get HTTP status code of a URL; optionally without following redirects
+# usage: url-status [-n (no-redirect - initial request only)] <url> -> HTTP status code (e.g., 200, 301, 404) or empty/error string on failure
+loam.url-status() {
+  local _url
+  local _redirects=true
+  local -a _curl_opts=(-s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10)
+  local _status
+  
+  local OPTIND opt
+  while getopts "nh" opt; do
+    case "$opt" in
+      n) _redirects=false ;;
+      *) echo "usage: url-status [-n (no-redirect - initial request only)] <url>" >&2; return 1;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  _url="${1-}"
+
+  if [[ -z "$_url" ]]; then echo "usage: url-status [-n (no-redirect - initial request only)] <url>" >&2; return $_E_USG; fi
+  
+  # Check: internet connectivity
+  if command -v loam.is-online &>/dev/null && ! loam.is-online; then _error "no internet connection available"; return $_E_NC; fi
+  # Check: dependency
+  command -v curl &>/dev/null || { _error "curl not found"; return $_E_DEP; }
+
+  $_redirects && _curl_opts+=(-L) # Default: Follow redirects else: -L is not added, so curl does not follow redirects
+  
+  # Get final status
+  _status=$(curl "${_curl_opts[@]}" "$_url")
+  echo "$_status"
+  # Return 0 if status is not empty and not "000" (curl connection error indicator)
+  [[ -n "$_status" && "$_status" != "000" ]] && return 0 || return 1 # Failure to get a valid status
+}
+
+# info: check if an HTTP endpoint exists (final status is 2xx)
+# usage: url-exists <url>
+loam.url-exists() {
+  local OPTIND; getopts "h" _ && { echo "usage: url-exists <url>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _url="${1-}"
+  local _status
+  local _status_rc # Exit code of url-status call
+
+  if [[ -z "$_url" ]]; then echo "usage: url-exists <url>" >&2; return $_E_USG; fi
+
+  # Check: internet connectivity
+  if command -v loam.is-online &>/dev/null && ! loam.is-online; then _error "no internet connection available"; return $_E_NC; fi
+
+  _status=$(loam.url-status "$_url")
+  _status_rc=$?
+
+  if [[ $_status_rc -eq $_E_DEP ]]; then # loam.url-status indicated curl was not found
+      # loam.url-status already printed its error message
+      return $_E_DEP # Propagate dependency error
+  elif [[ $_status_rc -ne 0 || -z "$_status" || "$_status" == "000" ]]; then
+    # loam.url-status failed to get a meaningful status (e.g. connection refused to specific host, timeout)
+    # or returned an error indicator like "000" from curl.
+    return 1 # General failure to determine existence / bad status from host
+  fi
+
+  # Definition of "exists": Successful responses (200-299)
+  if [[ "$_status" -ge 200 && "$_status" -le 299 ]]; then
+    _log "true"
+    return 0 # Exists (2xx range)
+  else
+    _log "false"
+    # Any other valid status code (1xx, 3xx, 4xx, 5xx) means it doesn't "exist" by this strict definition
+    return 1
+  fi
+}
+
+# info: fetch HTTP headers for a given URL
+# usage: url--headers [-n (no-redirect)] <url> -> all headers
+loam.url-headers() {
+  local _url
+  local _redirects=true
+  local -a _curl_opts=(-sI --connect-timeout 5 --max-time 10)
+
+  local OPTIND opt
+  while getopts "nh" opt; do
+    case "$opt" in
+      n) _redirects=false ;;
+      *) echo "usage: url-headers [-n (no-redirect)] <url>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  
+  _url="${1-}"
+  if [[ -z "$_url" ]]; then echo "usage: url-headers [-n (no-redirect)] <url>" >&2; return $_E_USG; fi
+  
+  # Check: internet connectivity
+  if command -v loam.is-online &>/dev/null && ! loam.is-online; then _error "no internet connection available"; return $_E_NC; fi
+  # Check: dependency
+  command -v curl &>/dev/null || { _error "curl not found"; return $_E_DEP; }
+
+  $_redirects && _curl_opts+=(-L) # Default: Follow redirects else: -L is not added, so curl does not follow redirects
+  
+  # Fetch headers and process them
+  local _raw_headers
+  _raw_headers=$(curl "${_curl_opts[@]}" "$_url") || return $?
+  
+  if [[ -z "$_raw_headers" ]]; then return 1; fi
+
+  # Post-process the headers:
+  # 1. Skip the first line (HTTP status line).
+  # 2. For subsequent lines, ensure they are in "Key: Value" format.
+  #    Some headers might be multi-line (obsolete but possible), this awk won't combine them.
+  #    It also removes blank lines that curl might output between header blocks (e.g., after redirects).
+  echo "$_raw_headers" | awk '
+    NR > 1 && NF > 0 { # NR > 1 skips the first line; NF > 0 skips blank lines
+      # Reconstruct to ensure consistent "Key: Value" even if original had extra spaces
+      # Find the first colon
+      first_colon = index($0, ":")
+      if (first_colon > 0) {
+        key = substr($0, 1, first_colon - 1)
+        value = substr($0, first_colon + 1)
+        # Trim leading space from value
+        gsub(/^[ \t]+/, "", value)
+        # Trim trailing carriage return if present (from Windows servers)
+        gsub(/\r$/, "", key)
+        gsub(/\r$/, "", value)
+        print key ": " value
+      }
+    }
+  '
+  # The exit status of awk will be used if it's the last command.
+  # If awk processes successfully, it returns 0.
+  return 0 # Explicitly return 0 if processing was successful
+}
+
+# info: fetch a specific HTTP header value from a URL (case-insensitive key match)
+# usage: url-header [-n (no-redirect)] <url> <header_name> -> header_value or empty
+loam.url-header() {
+  local _url _header_name
+  local _redirects=true
+  local -a _headers_opts=()
+
+  local OPTIND opt
+  while getopts "nh" opt; do
+    case "$opt" in
+      n) _redirects=false; _headers_opts+=(-n) ;;
+      *) echo "usage: url-header [-n (no-redirect)] <url> <header_name>" >&2; return 1 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  
+  _url="${1-}"
+  _header_name="${2-}"
+  
+  if [[ -z "$_url" || -z "$_header_name" ]]; then echo "usage: url-header [-n (no-redirect)] <url> <header_name>" >&2; return $_E_USG; fi
+  
+  # Call loam.url-headers and extract the specific header (case-insensitive)
+  loam.url-headers "${_headers_opts[@]}" "$_url" | awk -v header="$_header_name" '
+    BEGIN { IGNORECASE = 1 }
+    {
+      # Split on first colon to get key and value
+      colon_pos = index($0, ": ")
+      if (colon_pos > 0) {
+        key = substr($0, 1, colon_pos - 1)
+        value = substr($0, colon_pos + 2)
+        if (tolower(key) == tolower(header)) {
+          print value
+          exit 0
+        }
+      }
+    }
+  '
+}
+
+# info: extract filename from URL using Content-Disposition header or URL path
+# usage: url-filename <url>
+loam.url-filename() {
+  local OPTIND; getopts "h" _ && { echo "usage: url-filename <url>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _url="${1-}"
+  local _filename
+
+  if [[ -z "$_url" ]]; then echo "usage: url-filename <url>" >&2; return $_E_USG; fi
+  
+  # Check: internet connectivity
+  if command -v loam.is-online &>/dev/null && ! loam.is-online; then _error "no internet connection available"; return $_E_NC; fi
+  # Check: dependency
+  command -v curl &>/dev/null || { _error "curl not found"; return $_E_DEP; }
+
+  # Method 1: Try curl's filename_effective (attempt regardless of help output)
+  _filename=$(curl -sSLJOw '%{filename_effective}' --connect-timeout 5 --max-time 10 -o /dev/null "$_url" 2>/dev/null)
+  # Clean up any whitespace/control characters
+  _filename=$(echo "$_filename" | tr -d '\r\n' | xargs)
+  _filename="${_filename%\"}"  # Remove trailing quote
+  _filename="${_filename#\"}"  # Remove leading quote
+  
+  if [[ -n "$_filename" && "$_filename" != "filename_effective" ]]; then
+    _filename=$(basename "$_filename")
+    _log "url-filename: used curl filename_effective -> $_filename"
+    echo "$_filename"
+    return 0
+  fi
+
+  # Method 2: Parse Content-Disposition from headers (fallback)
+  if command -v loam.url-header &>/dev/null; then
+    local _content_disp
+    _content_disp=$(loam.url-header "$_url" "content-disposition" 2>/dev/null)
+    
+    if [[ -n "$_content_disp" ]]; then
+      # Extract filename from Content-Disposition header
+      _filename=$(echo "$_content_disp" | sed -n 's/.*filename[*]*=["'\'']*\([^"'\'';\r\n]*\).*/\1/p' | head -1)
+      # Handle UTF-8 encoding prefix
+      _filename="${_filename#UTF-8\'\'}"
+      
+      if [[ -n "$_filename" ]]; then
+        # URL decode %XX sequences
+        _filename=$(printf '%b' "${_filename//%/\\x}" 2>/dev/null || echo "$_filename")
+        _filename=$(basename "$_filename")
+        _log "url-filename: used content-disposition header -> $_filename"
+        echo "$_filename"
+        return 0
+      fi
+    fi
+  fi
+
+  # # Method 3: Extract from URL path (strip query/fragment)
+  # local _path_part="${_url%%\?*}"    # Remove query string
+  # local _path_clean="${_path_part%\#*}"  # Remove fragment
+  #
+  # if [[ "$_path_clean" != */ && "$_path_clean" == *.* ]]; then
+  #   _filename=$(basename "$_path_clean")
+  #   if [[ -n "$_filename" && "$_filename" != "." ]]; then
+  #     _log "url-filename: used url path extraction -> $_filename"
+  #     echo "$_filename"
+  #     return 0
+  #   fi
+  # fi
+
+  # Method 3: Extract from URL path (strip query/fragment)
+  local _path_part="${_url%%\?*}"    # Remove query string
+  local _path_clean="${_path_part%\#*}"  # Remove fragment
+  local _filename_from_path
+
+  _filename_from_path=$(basename "$_path_clean")
+  if [[ -n "$_filename_from_path" && "$_filename_from_path" != "." && "$_filename_from_path" != "/" ]]; then
+    _filename="$_filename_from_path" # Assign to _filename for consistency
+    _log "url-filename: used url path extraction -> $_filename"
+    echo "$_filename"
+    return 0
+  fi
+	
+  # Method 4: Generate fallback filename with timestamp
+  _filename="download_$(loam.str-timestamp file)"
+  _log "url-filename: used timestamp fallback -> $_filename"
+  echo "$_filename"
+}
+
+# info: download a file from URL to destination file
+# usage: url-download <url> <destination_file>
+loam.url-download() {
+  local OPTIND; getopts "h" _ && { echo "usage: url-download <url> <destination_file>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _url="${1-}" _dst="${2-}"
+  local _dst_dir
+
+  if [[ -z "$_url" || -z "$_dst" ]]; then echo "usage: url-download <url> <destination_file>" >&2; return $_E_USG; fi
+  # Reject if destination is a directory
+  if [[ -d "$_dst" ]]; then _error "destination_file must be a file path, not directory: $_dst"; return 1; fi
+	  
+  # Check: internet connectivity
+  if command -v loam.is-online &>/dev/null && ! loam.is-online; then _error "no internet connection available"; return $_E_NC; fi
+
+  _dst_dir=$(dirname "$_dst")
+  if ! loam.make-dir -q "$_dst_dir"; then _error "failed to create destination directory: $_dst_dir"; return 1; fi
+
+  # Skip download if file already exists
+  if [[ -f "$_dst" ]]; then
+    _log "file already exists: $_dst"; return 0
+  fi
+
+  _log "downloading $_url to $_dst..."
+  if command -v curl &>/dev/null; then
+    if ! curl -L -sS --fail --retry 3 --retry-delay 2 -o "$_dst" "$_url"; then
+      _error "download failed with curl: $_url"; rm -f "$_dst"; return 1
+    fi
+  elif command -v wget &>/dev/null; then
+    if ! wget -q --tries=3 --timeout=15 -O "$_dst" "$_url"; then
+      _error "download failed with wget: $_url"; rm -f "$_dst"; return 1
+    fi
+  else
+    _error "neither curl nor wget is available"; return $_E_DEP
+  fi
+  _log "download complete: $_dst"
+  echo "$_dst"
+  return 0
+}
+
+# info: download file or extract archive with optional selection and verification
+# usage: smart-download [-e extract] [-s selector] [-f force] [-x exec_pattern] [-c checksum] <url> [destination_directory]
+loam.smart-download() {
+  local _extract=false
+  local _selector=""
+  local _force=false
+  local _exec_pattern=""
+  local _checksum=""
+  local _url _dest _abs_dest
+
+  local OPTIND opt
+  while getopts "es:fx:c:h" opt; do
+    case $opt in
+      e) _extract=true ;;
+      s) _selector="$OPTARG" ;;
+      f) _force=true ;;
+      x) _exec_pattern="$OPTARG" ;;
+      c) _checksum="$OPTARG" ;;
+      *)
+      echo "usage: smart-download [-e extract] [-s selector] [-f force] [-x exec_pattern] [-c checksum] <url> [destination_directory]" >&2;
+      sed -n '/^##sec-start-help-smart-download/,/^##sec-end-help-smart-download/p' "$_RPATH" | sed '1d;$d'
+      return $_E_USG
+      ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  _url="${1-}"
+  _dest="${2:-.}"
+
+  if [[ -z "$_url" ]]; then echo "usage: smart-download [-e extract] [-s selector] [-f force] [-x exec_pattern] [-c checksum] <url> [destination_directory]" >&2; return $_E_USG; fi
+
+  # Validate that selector requires extract mode
+  if [[ -n "$_selector" && "$_extract" != true ]]; then
+    _error "selector (-s) requires extract mode (-e)"; return $_E_USG
+  fi
+
+  # Create destination directory if needed
+  if ! loam.make-dir -q "$_dest"; then _error "failed to create destination directory: $_dest"; return 1; fi
+
+  # Get absolute path for destination
+  if ! _abs_dest=$(cd -- "$_dest" && pwd); then
+    _error "could not determine absolute path for destination: $_dest"; return 1
+  fi
+
+  # Check if URL exists (mandatory check)
+  _log "smart-download: checking url: $_url"
+  if ! loam.url-exists "$_url"; then
+    _error "url is not accessible: $_url"; return $_E_NF
+  fi
+
+  # Determine filename for download
+  local _filename
+  _filename=$(loam.url-filename "$_url") || { _error "failed to determine filename from URL"; return 1; }
+
+  _debug "smart-download: mode=$(if $_extract; then echo 'extract'; else echo 'file'; fi), filename=$_filename, dest=$_abs_dest"
+
+  # File download mode (no extraction)
+  if ! $_extract; then
+    local _target_file="$_abs_dest/$_filename"
+
+    # Check if file exists and handle force flag
+    if [[ -f "$_target_file" && "$_force" != true ]]; then
+      _error "smart-download: file already exists: $_target_file (use -f to force overwrite)"; return 1
+    fi
+
+    # Download the file
+    _log "smart-download: downloading $_url to $_abs_dest as $_filename"
+    if ! loam.url-download "$_url" "$_target_file"; then
+      _error "smart-download: failed to download file"; return 1
+    fi
+
+    # Verify checksum if provided
+    if [[ -n "$_checksum" ]]; then
+      _log "smart-download: verifying checksum: $_checksum"
+      if ! loam.verify-checksum "$_target_file" "$_checksum"; then
+        local _failed_file
+        _failed_file=$(loam.temp-move "$_target_file" "failed_download_$_filename")
+        _error "smart-download: checksum verification failed - file preserved at: $_failed_file"; return 1
+      fi
+      _log "smart-download: checksum verified"
+    fi
+
+    # Make the downloaded file executable if _exec_pattern is provided and matches
+    if [[ -n "$_exec_pattern" ]]; then
+      # Using glob pattern matching, consistent with find -iname
+      # shellcheck disable=SC2053 # intentional: _exec_pattern is a caller-supplied glob, not a literal to quote
+      if [[ "$(basename "$_target_file")" == $_exec_pattern ]]; then
+        _log "smart-download: making downloaded file '$_target_file' executable as it matches pattern '$_exec_pattern'"
+        if chmod +x "$_target_file"; then
+          _log "smart-download: successfully made '$_target_file' executable"
+        else
+          _error "smart-download: failed to make '$_target_file' executable"
+          # Consider if this failure should be fatal (return 1) - for now, it logs an error and continues.
+        fi
+      else
+        _debug "smart-download: downloaded file '$_target_file' does not match exec pattern '$_exec_pattern'"
+      fi
+    fi
+    # if [[ -n "$_exec_pattern" ]]; then
+    #   _log "making files matching '$_exec_pattern' executable"
+    #   find "$_abs_dest" -type f -iname "$_exec_pattern" -exec chmod +x {} \; 2>/dev/null || _warn "no files found matching exec pattern '$_exec_pattern'"
+    # fi
+
+    _log "smart-download: file download completed"
+    echo "$_abs_dest"
+    return 0
+  fi
+
+  # Extract mode - download to temp, verify, then extract/install
+  local _temp_dir
+  _temp_dir=$(mktemp -d) || { _error "failed to create temporary directory"; return 1; }
+
+  local _temp_file="$_temp_dir/$_filename"
+  
+  _log "smart-download: downloading archive to temporary location"
+  if ! loam.url-download "$_url" "$_temp_file" >/dev/null; then
+    _error "smart-download: failed to download archive"
+    rm -rf "$_temp_dir"
+    return 1
+  fi
+
+  # Verify checksum if provided
+  if [[ -n "$_checksum" ]]; then
+    _log "smart-download: verifying archive checksum: $_checksum"
+    if ! loam.verify-checksum "$_temp_file" "$_checksum"; then
+      local _failed_file
+      _failed_file=$(loam.temp-move "$_temp_file" "failed_download")
+      rm -rf "$_temp_dir"
+      _error "smart-download: checksum verification failed - archive preserved at: $_failed_file"; return 1
+    fi
+    _log "smart-download: archive checksum verified"
+  fi
+
+  # Handle DMG files specially
+  if [[ "$_filename" == *.dmg ]]; then
+    if [[ "$(os)" != "mac" ]]; then
+      _error "smart-download: DMG files can only be installed on macOS"
+      rm -rf "$_temp_dir"
+      return 1
+    fi
+    
+    _log "smart-download: installing DMG to $_abs_dest"
+    local _install_result
+    _install_result=$(loam.install-dmg "$_temp_file" "$_selector" "$_abs_dest") || {
+      local _failed_file
+      _failed_file=$(loam.temp-move "$_temp_file" "failed_dmg_install")
+      rm -rf "$_temp_dir"
+      _error "smart-download: DMG installation failed - file preserved at: $_failed_file"
+      return 1
+    }
+    
+    # Cleanup temp directory
+    rm -rf "$_temp_dir"
+    
+    _log "smart-download: DMG installation completed successfully"
+    echo "$_install_result"
+    return 0
+  fi
+
+  # Handle regular archives
+  local -a _extract_args=()
+  [[ -n "$_selector" ]] && _extract_args+=(-s "$_selector")
+  $_force && _extract_args+=(-f)
+  [[ -n "$_exec_pattern" ]] && _extract_args+=(-x "$_exec_pattern")
+
+  # Extract the archive
+  _log "smart-download: extracting archive to destination"
+  local _extract_result
+  
+  if [[ ${#_extract_args[@]} -gt 0 ]]; then
+    _debug "loam.smart-extract ${_extract_args[*]} $_temp_file $_abs_dest"
+    _extract_result=$(loam.smart-extract "${_extract_args[@]}" "$_temp_file" "$_abs_dest")
+  else
+    _debug "loam.smart-extract $_temp_file $_abs_dest"
+    _extract_result=$(loam.smart-extract "$_temp_file" "$_abs_dest")
+  fi
+  local _extract_exit_code=$?
+  
+  if [[ $_extract_exit_code -ne 0 ]]; then
+    local _failed_file
+    _failed_file=$(loam.temp-move "$_temp_file" "failed_extract")
+    rm -rf "$_temp_dir"
+    _error "smart-download: extraction failed - archive preserved at: $_failed_file"; return 1
+  fi
+
+  # Cleanup temp directory
+  rm -rf "$_temp_dir"
+
+  _log "smart-download: extraction completed successfully"
+  echo "$_extract_result"
+  return 0
+}
+
+#++++++++++++++++++++++++++++++++++++++
+##sec-start-help-smart-download
+# Basic file download:
+#   smart-download "https://example.com/binary" "/usr/local/bin/"
+#   smart-download "https://example.com/script.sh" "."
+#
+# File download with checksum verification:
+#   smart-download -c "sha256hash" "https://example.com/binary" "/usr/local/bin/"
+#   smart-download -c "abcd1234..." "https://example.com/file.zip" "/downloads/"
+#
+# File download with executable permissions:
+#   smart-download -x "binary" "https://example.com/binary" "/usr/local/bin/"
+#   smart-download -x "*.sh" "https://example.com/scripts.tar.gz" "/usr/local/bin/"
+#
+# Force overwrite existing files:
+#   smart-download -f "https://example.com/update.zip" "/downloads/"
+#   smart-download -f -c "hash" "https://example.com/binary" "/usr/local/bin/"
+#
+# Basic archive extraction:
+#   smart-download -e "https://example.com/archive.zip" "/project/"
+#   smart-download -e "https://example.com/software.tar.gz" "/opt/"
+#
+# Selective archive extraction:
+#   smart-download -e -s "*.app" "https://example.com/mac-software.zip" "/Applications/"
+#   smart-download -e -s "kubectl" "https://k8s.io/kubectl.tar.gz" "/usr/local/bin/"
+#   smart-download -e -s "config*" "https://example.com/app-config.zip" "/etc/myapp/"
+#
+# Archive extraction with executable permissions:
+#   smart-download -e -s "install.sh" -x "install.sh" "https://example.com/installer.zip" "/tmp/"
+#   smart-download -e -s "*.sh" -x "*.sh" "https://example.com/scripts.tar.gz" "/usr/local/bin/"
+#   smart-download -e -s "binary" -x "binary" "https://example.com/tools.zip" "/usr/local/bin/"
+#
+# DMG installation (macOS only):
+#   smart-download -e "https://example.com/MyApp.dmg" "/Applications/"
+#   smart-download -e -s "MyApp.app" "https://example.com/Software.dmg" "/Applications/"
+#   smart-download -e -c "sha256hash" "https://example.com/VerifiedApp.dmg" "/Applications/"
+#
+# Combined flags for complex scenarios:
+#   smart-download -e -f -s "kubectl" -x "kubectl" -c "sha256hash" "https://k8s.io/kubectl.tar.gz" "/usr/local/bin/"
+#   smart-download -e -f -s "*.app" "https://example.com/mac-app.zip" "/Applications/"
+#   smart-download -f -c "hash" -x "deploy*" "https://example.com/deployment.tar.gz" "/opt/app/"
+#
+# Real-world scenarios:
+#   # Download and install kubectl with verification
+#   smart-download -e -s "kubectl" -x "kubectl" -c "a1b2c3..." "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl.tar.gz" "/usr/local/bin/"
+#   
+#   # Install macOS application
+#   smart-download -e -s "*.app" "https://example.com/MyApp.zip" "/Applications/"
+#   
+#   # Download shell scripts and make them executable
+#   smart-download -e -s "*.sh" -x "*.sh" "https://example.com/dotfiles.tar.gz" "$HOME/.local/bin/"
+#   
+#   # Download single binary with checksum verification
+#   smart-download -c "sha256hash" -x "binary" "https://github.com/user/project/releases/download/v1.0/binary" "/usr/local/bin/"
+#   
+#   # Extract configuration files from archive
+#   smart-download -e -s "config" -f "https://example.com/app-config.zip" "/etc/myapp/"
+#   
+#   # Download and extract tools with force overwrite
+#   smart-download -e -f -s "tools/*" -x "tools/*" "https://example.com/toolkit.tar.gz" "/usr/local/"
+#
+#   # Real World Example
+#   smart-download -e -s "*.app" "https://download.sublimetext.com/sublime_text_build_4200_mac.zip" /tmp/p
+##sec-end-help-smart-download
+#++++++++++++++++++++++++++++++++++++++
+##] network
+
+##[ string
+
+# info: display current timestamp in various formats
+# usage: str-timestamp [format iso (default), date, time, unix, utc, file]
+loam.str-timestamp() {
+  local OPTIND; getopts "h" _ && { echo "usage: str-timestamp [format iso (default), date, time, unix, utc, file]" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  local _format="${1:-iso}"
+  
+  case "$_format" in
+    iso)  date "+%Y-%m-%d %H:%M:%S" ;;
+    date) date "+%Y-%m-%d" ;;
+    time) date "+%H:%M:%S" ;;
+    unix) date "+%s" ;;
+    utc)  date -u "+%Y-%m-%dT%H:%M:%SZ" ;;
+    file) date "+%Y%m%d-%H%M%S" ;;
+    *) echo "usage: str-timestamp [format iso (default), date, time, unix, utc, file]" >&2; return $_E_USG ;;
+  esac
+}
+
+# info: generate random string with customizable options
+# usage: str-random [-a alphanumeric only] [-l lowercase only] [length (16)]
+loam.str-random() {
+  local _length=16
+  local _alphanumeric=false
+  local _lowercase=false
+
+  local OPTIND opt
+  while getopts "alh" opt; do
+    case "$opt" in
+      a) _alphanumeric=true ;;
+      l) _lowercase=true ;;
+      *) echo "usage: str-random [-a alphanumeric only] [-l lowercase only] [length (16)]" >&2; return "$_E_USG" ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  # Build charset based on flags
+  local _charset
+  if [[ "$_alphanumeric" == true && "$_lowercase" == true ]]; then
+    _charset="a-z0-9"  # Both flags: lowercase alphanumeric
+  elif [[ "$_alphanumeric" == true ]]; then
+    _charset="A-Za-z0-9"  # Just -a: alphanumeric
+  elif [[ "$_lowercase" == true ]]; then
+    _charset="a-z0-9!@#$%^&*()_+=-"  # Just -l: lowercase with symbols
+  else
+    _charset="A-Za-z0-9!@#$%^&*()_+=-"  # Default: full charset
+  fi
+
+  if [[ -n "${1-}" ]]; then
+    if [[ ${1-} =~ ^[1-9][0-9]*$ ]]; then
+      _length="$1"
+    elif [[ ${1-} == "0" ]]; then
+      _length=0
+    else
+       _error "length must be a number"; return $_E_USG
+    fi
+  fi
+
+  if [[ "$_length" -eq 0 ]]; then return 0; fi # Output nothing for length 0
+
+  local _random_string
+  if [[ -r /dev/urandom ]]; then
+    _random_string=$(LC_ALL=C tr -dc "$_charset" < /dev/urandom | head -c "$_length")
+  elif command -v openssl &>/dev/null; then
+    _random_string=$(LC_ALL=C tr -dc "$_charset" < <(openssl rand -base64 "$((_length * 2))") | head -c "$_length")
+  else
+    _error "/dev/urandom not available and openssl not found"; return $_E_DEP
+  fi
+
+  if [[ ${#_random_string} -lt $_length ]]; then
+     _warn "generated string is shorter than requested (${#_random_string}/${_length})"
+  fi
+
+  echo "$_random_string"
+  # Implicitly returns 0 if echo succeeds, or the exit status of echo if it somehow fails.
+}
+
+# info: convert text to uppercase
+# usage: str-upper [text] or <input> | loam.str-upper
+loam.str-upper() {
+  if [[ -p /dev/stdin ]]; then
+    # Read from stdin if piped
+    tr '[:lower:]' '[:upper:]'
+  elif [[ $# -gt 0 ]]; then
+    # Process arguments if providedloam.clip-set
+    echo "$*" | tr '[:lower:]' '[:upper:]' # Use "$*" to treat all args as a single string
+  else
+    # No input and no arguments, show usage
+    echo "usage: str-upper [text] or <input> | loam.str-upper" >&2; return "$_E_USG"
+  fi
+  # Implicitly returns the exit status of 'tr' or 'echo | tr'
+}
+
+# info: convert text to lowercase
+# usage: str-lower [text] or <input> | loam.str-lower
+loam.str-lower() {
+  if [[ -p /dev/stdin ]]; then
+    # Read from stdin if piped
+    tr '[:upper:]' '[:lower:]'
+  elif [[ $# -gt 0 ]]; then
+    # Process arguments if provided
+    echo "$*" | tr '[:upper:]' '[:lower:]' # Use "$*" to treat all args as a single string
+  else
+    # No input and no arguments, show usage
+    echo "usage: str-lower [text] or <input> | loam.str-lower" >&2; return "$_E_USG"
+  fi
+  # Implicitly returns the exit status of 'tr' or 'echo | tr'
+}
+##] string
+
+##[ clipboard
+
+# info: get content from clipboard
+# usage: clip-get
+loam.clip-get() {
+  if command -v pbpaste &>/dev/null; then
+    pbpaste									# macOS
+  elif command -v xclip &>/dev/null; then
+    xclip -selection clipboard -o			# Linux with xclip
+  elif command -v xsel &>/dev/null; then
+    xsel --clipboard --output				# Linux with xsel
+  elif command -v powershell.exe &>/dev/null; then
+    powershell.exe -noprofile -command Get-Clipboard # Windows with WSL
+  else
+    _error "no clipboard get command available (pbpaste/xclip/xsel/powershell)"; return $_E_DEP
+  fi
+  return $?
+}
+
+# info: set content to clipboard
+# usage: clip-set [text] or pipe input
+loam.clip-set() {
+  local _input_text # Used for argument input
+
+  if [[ -p /dev/stdin ]]; then
+    # Handle piped input
+    if command -v pbcopy &>/dev/null; then pbcopy;									# macOS
+    elif command -v xclip &>/dev/null; then xclip -selection clipboard -i;			# Linux with xclip
+    elif command -v xsel &>/dev/null; then xsel --clipboard --input;				# Linux with xsel
+    elif command -v clip.exe &>/dev/null; then clip.exe;								# Windows with WSL (native)
+    elif command -v powershell.exe &>/dev/null; then powershell.exe -noprofile -command "\$input|Set-Clipboard"; # Windows with WSL (powershell)
+    else
+        _error "no clipboard set command available (pbcopy/xclip/xsel/clip.exe/powershell)"; return $_E_DEP
+    fi
+    return $?
+  elif [[ $# -gt 0 ]]; then
+    # Handle direct arguments
+    _input_text="$*"
+    if command -v pbcopy &>/dev/null; then echo -n "$_input_text" | pbcopy;						# macOS
+    elif command -v xclip &>/dev/null; then echo -n "$_input_text" | xclip -selection clipboard -i;	# Linux with xclip
+    elif command -v xsel &>/dev/null; then echo -n "$_input_text" | xsel --clipboard --input;		# Linux with xsel
+    elif command -v clip.exe &>/dev/null; then echo -n "$_input_text" | clip.exe;					# Windows with WSL (native)
+    elif command -v powershell.exe &>/dev/null; then echo -n "$_input_text" | powershell.exe -noprofile -command "\$input|Set-Clipboard"; # Windows with WSL (powershell)
+    else
+      _error "no clipboard set command available (pbcopy/xclip/xsel/clip.exe/powershell)"; return $_E_DEP
+    fi
+    return $?
+  else
+      echo "usage: clip-set [text] or <input> | loam.clip-set" >&2; return $_E_USG
+  fi
+}
+##] clipboard
+
+##[ secret-management
+
+# info: forces a sudo authentication prompt if the user's sudo timestamp has expired
+# usage: sudo-auth "Reason for prompt"
+loam.sudo-auth() {
+  local _reason="${1-}"
+  
+  if ! command -v sudo &>/dev/null; then
+    _error "sudo command not found, cannot authenticate user"
+    return $_E_DEP
+  fi
+
+  # -v (validate) updates the user's timestamp, prompting for a password if necessary.
+  # It does not run a command as root. It is perfect for an authentication check.
+  if sudo -v; then
+    return 0 # User is authenticated
+  else
+    _error "sudo authentication failed - cannot proceed"
+    return 1 # User failed or cancelled the prompt
+  fi
+}
+
+# info: save a secret/password to system credential store
+# usage: secret-set [-f (force update)] [-i (insecure, allow non-interactive access)] <service_name> [password]
+loam.secret-set() {
+  local _force=false
+  local _insecure=false
+  local OPTIND opt
+  while getopts "fih" opt; do
+    case "$opt" in
+      f) _force=true ;;
+      i) _insecure=true ;;
+      *) echo "usage: secret-set [-f (force update)] [-i (insecure, allow non-interactive access)] <service_name> [password]" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  local _service="${1-}" _password="${2-}"
+  [[ -z "$_service" ]] && { echo "usage: secret-set [-f (force update)] [-i (insecure, allow non-interactive access)] <service_name> [password]" >&2; return $_E_USG; }
+
+  local _exists=false
+  loam.secret-exists "$_service" && _exists=true
+
+  if [[ "$_exists" == true ]]; then
+    if [[ "$_force" != true ]]; then
+      _error "secret '$_service' already exists. use -f to force update."
+      return 1
+    fi
+    _log "secret '$_service' exists, updating with force flag..."
+  fi
+
+  if [[ -z "$_password" ]]; then
+    _password=$(loam.readline "password: ")
+    [[ -z "$_password" ]] && { _error "password cannot be empty"; return $_E_USG; }
+  fi
+
+  case "$(os)" in
+    mac)
+      # For macOS, an update must be a delete-then-add to ensure the ACL is correctly re-applied.
+      # Simply updating an existing item does not reliably change its ACL.
+      if [[ "$_exists" == true ]]; then
+        # Call 'security delete' directly to avoid the interactive prompt from our wrapper.
+        security delete-generic-password -a "$(whoami)" -s "$_service" >/dev/null 2>&1 || true
+      fi
+
+      local -a sec_opts=(-a "$(whoami)" -s "$_service" -w "$_password")
+      if [[ "$_insecure" != true ]]; then
+        # Secure by default: -T /dev/null forces an empty ACL, requiring user auth (Touch ID/pass) on get.
+        sec_opts+=(-T "/dev/null")
+      else
+        _warn "saving '$_service' in insecure mode; non-interactive access will be allowed"
+      fi
+
+      # The -U flag is not needed as we are always performing a creation.
+      if security add-generic-password "${sec_opts[@]}" 2>/dev/null; then
+        _log "secret saved/updated in macOS keychain: $_service"
+      else
+        _error "failed to save secret to macOS keychain"; return $_E
+      fi
+      ;;
+    linux)
+      if command -v secret-tool &>/dev/null; then
+        if [[ "$_exists" == true ]]; then
+          # Call 'secret-tool clear' directly to avoid the interactive prompt from our wrapper.
+          secret-tool clear service "$_service" >/dev/null 2>&1 || true
+        fi
+        if echo -n "$_password" | secret-tool store --label="$_service" service "$_service" 2>/dev/null; then
+          _log "secret saved/updated in GNOME keyring: $_service"
+        else
+          _error "failed to save secret to GNOME keyring"; return $_E
+        fi
+      elif command -v pass &>/dev/null; then
+        # For pass, the '-f' flag handles updates.
+        local -a pass_opts=()
+        [[ "$_force" == true ]] && pass_opts+=("-f")
+        
+        if echo -n "$_password" | pass insert "${pass_opts[@]}" "$_service" 2>/dev/null; then
+          _log "secret saved/updated in pass store: $_service"
+        else
+          _error "failed to save secret to pass store"; return $_E
+        fi
+      else
+        _error "no supported credential store found (install libsecret-tools or pass)"; return $_E_DEP
+      fi
+      ;;
+    *)
+      _error "credential storage not supported on $(os)"; return $_E_OS
+      ;;
+  esac
+}
+
+# info: retrieve a secret/password from system credential store
+# usage: secret-get <service_name>
+loam.secret-get() {
+  local OPTIND; getopts "h" _ && { echo "usage: secret-get <service_name>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  
+  local _service="${1-}"
+  [[ -z "$_service" ]] && { echo "usage: secret-get <service_name>" >&2; return $_E_USG; }
+  
+  case "$(os)" in
+    mac)
+      # The user will be prompted by the OS if the secret was set securely (without -i).
+      security find-generic-password -a "$(whoami)" -s "$_service" -w 2>/dev/null
+      ;;
+    linux)
+      if command -v secret-tool &>/dev/null; then
+        secret-tool lookup service "$_service" 2>/dev/null
+      elif command -v pass &>/dev/null; then
+        pass show "$_service" 2>/dev/null | head -1
+      else
+        return $_E_DEP
+      fi
+      ;;
+    *)
+      return $_E_OS
+      ;;
+  esac
+}
+
+# info: check if a secret exists in system credential store
+# usage: secret-exists <service_name>
+loam.secret-exists() {
+  local OPTIND; getopts "h" _ && { echo "usage: secret-exists <service_name>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  
+  local _service="${1-}"
+  [[ -z "$_service" ]] && { echo "usage: secret-exists <service_name>" >&2; return $_E_USG; }
+  
+  case "$(os)" in
+    mac)
+      security find-generic-password -a "$(whoami)" -s "$_service" &>/dev/null
+      ;;
+    linux)
+      if command -v secret-tool &>/dev/null; then
+        secret-tool lookup service "$_service" &>/dev/null
+      elif command -v pass &>/dev/null; then
+        pass show "$_service" &>/dev/null
+      else
+        return $_E_DEP
+      fi
+      ;;
+    *)
+      return $_E_OS
+      ;;
+  esac
+}
+
+# info: delete a secret/password from system credential store
+# usage: secret-delete <service_name>
+loam.secret-delete() {
+  local OPTIND; getopts "h" _ && { echo "usage: secret-delete <service_name>" >&2; return $_E_USG; }; shift $((OPTIND-1))
+  
+  local _service="${1-}"
+  [[ -z "$_service" ]] && { echo "usage: secret-delete <service_name>" >&2; return $_E_USG; }
+  
+  case "$(os)" in
+    mac)
+      # The user will be prompted by the OS if the secret was set securely.
+      if security delete-generic-password -a "$(whoami)" -s "$_service" 2>/dev/null; then
+        _log "secret deleted from macOS keychain: $_service"
+      else
+        _warn "secret not found or already deleted: $_service"
+      fi
+      ;;
+    linux)
+      if command -v secret-tool &>/dev/null; then
+        if secret-tool clear service "$_service" 2>/dev/null; then
+          _log "secret deleted from GNOME keyring: $_service"
+        else
+          _warn "secret not found or already deleted: $_service"
+        fi
+      elif command -v pass &>/dev/null; then
+        if pass rm --force "$_service" 2>/dev/null; then
+          _log "secret deleted from pass store: $_service"
+        else
+          _warn "secret not found or already deleted: $_service"
+        fi
+      fi
+      ;;
+  esac
+}
+
+# info: securely retrieves a secret from keychain or an interactive prompt (pipeline-aware) - returns the secret on stdout
+# usage: loam.secret-get-or-prompt <service_name> [-p <prompt_text>] [-c (cache password)]
+loam.secret-get-or-prompt() {
+  local _prompt=""
+  local _cache_password=false
+  local OPTIND opt
+
+  while getopts "p:ch" opt; do
+    case "$opt" in
+      p) _prompt="$OPTARG" ;;
+      c) _cache_password=true ;;
+      h|*)
+        echo "usage: loam.secret-get-or-prompt <service_name> [-p <prompt_text>] [-c (cache password)]" >&2
+        return $_E_USG
+        ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  local _service="${1-}"
+  if [[ -z "$_service" ]]; then
+    _error "service name is a required argument."
+    echo "usage: loam.secret-get-or-prompt <service_name> [-p <prompt_text>] [-c (cache password)]" >&2
+    return $_E_USG
+  fi
+
+  # 1. Attempt to retrieve the secret non-interactively from the keychain.
+  local _password
+  _password=$(loam.secret-get "$_service" 2>/dev/null)
+
+  # 2. If found, print it to stdout and exit successfully.
+  if [[ -n "$_password" ]]; then
+    printf "%s" "$_password"
+    return 0
+  fi
+
+  # 3. If not found, proceed directly to prompting.
+  # We trust the underlying loam.readline to handle truly non-interactive
+  # sessions (e.g. cron) by failing if it cannot open /dev/tty.
+  _warn "secret for '$_service' not found in keychain."
+  
+  if [[ -z "$_prompt" ]]; then
+    _prompt="Enter password for '$_service': "
+  fi
+  _password=$(loam.readline "$_prompt")
+  if [[ -z "$_password" ]]; then
+    _error "password cannot be empty"
+    return 1
+  fi
+
+  if [[ "$_cache_password" == true ]]; then
+    if loam.confirm "Cache this password in the keychain for '$_service'?"; then
+      loam.secret-set "$_service" "$_password"
+    fi
+  fi
+
+  printf "%s" "$_password"
+  return 0
+}
+##] secret-management
+
+##[ encryption
+
+# info: encrypt data from stdin or argument using AES-256 with a password, output base64.
+# usage: <input> | encrypt-aes <password> or encrypt-aes <password> <string_to_encrypt>
+loam.encrypt-aes() {
+  local _password
+  local OPTIND opt
+  while getopts "h" opt; do
+    case "$opt" in
+      *) echo "usage: <input> | encrypt-aes <password> or encrypt-aes <password> <string_to_encrypt>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  command -v openssl &>/dev/null || { _error "openssl command not found."; return $_E_DEP; }
+
+  if [[ $# -eq 0 ]]; then
+    echo "usage: <input> | encrypt-aes <password> or encrypt-aes <password> <string_to_encrypt>" >&2; return $_E_USG
+  fi
+  
+  _password="${1-}"
+  shift
+
+  local -a openssl_args=(enc -aes-256-cbc -pbkdf2 -md sha256 -salt -a -pass "pass:$_password")
+  local rc=0
+  local openssl_stderr=""
+
+  # The 3>&1 trick allows us to pipe openssl's real stdout to our stdout,
+  # while capturing only its stderr into the variable.
+  if [[ $# -gt 0 ]]; then
+    openssl_stderr=$(printf "%s" "${1-}" | openssl "${openssl_args[@]}" 2>&1 >&3)
+    rc=$?
+  elif [[ -p /dev/stdin ]] || [[ ! -t 0 ]]; then
+    openssl_stderr=$(openssl "${openssl_args[@]}" 2>&1 >&3)
+    rc=$?
+  else
+    _error "no string argument provided and no input piped from stdin."; return $_E_USG
+  fi 3>&1
+
+  if [[ $rc -ne 0 ]]; then
+    _error "openssl execution failed with: $openssl_stderr"
+    _error "encryption failed - check password or input"
+    return $_E
+  fi
+  
+  return $_S
+}
+
+# info: decrypt base64 AES-256 encrypted data from stdin or argument using a password.
+# usage: <encrypted_input> | decrypt-aes <password> or decrypt-aes <password> <encrypted_string>
+loam.decrypt-aes() {
+  local _password
+  local OPTIND opt
+  while getopts "h" opt; do
+    case "$opt" in
+      *) echo "usage: <encrypted_input> | decrypt-aes <password> or decrypt-aes <password> <encrypted_string>" >&2; return $_E_USG ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  command -v openssl &>/dev/null || { _error "openssl command not found."; return $_E_DEP; }
+
+  if [[ $# -eq 0 ]]; then
+    echo "usage: <encrypted_input> | decrypt-aes <password> or decrypt-aes <password> <encrypted_string>" >&2; return $_E_USG
+  fi
+  
+  _password="${1-}"
+  shift
+
+  local -a openssl_args=(enc -d -aes-256-cbc -pbkdf2 -md sha256 -salt -a -pass "pass:$_password")
+  local rc=0
+  local openssl_stderr=""
+
+  # The 3>&1 trick allows us to pipe openssl's real stdout to our stdout,
+  # while capturing only its stderr into the variable.
+  if [[ $# -gt 0 ]]; then
+    openssl_stderr=$(printf "%s\n" "${1-}" | openssl "${openssl_args[@]}" 2>&1 >&3)
+    rc=$?
+  elif [[ -p /dev/stdin ]] || [[ ! -t 0 ]]; then
+    openssl_stderr=$(openssl "${openssl_args[@]}" 2>&1 >&3)
+    rc=$?
+  else
+    _error "no string argument provided and no input piped from stdin."; return $_E_USG
+  fi 3>&1
+
+
+  if [[ $rc -ne 0 ]]; then
+    _error "openssl execution failed with: $openssl_stderr"
+    _error "decryption failed - check password or input"
+    return $_E
+  fi
+  
+  return $_S
+}
+##] encryption
+
+##[ encoding
+
+# info: pretty-print JSON from stdin to stdout
+# usage: <input> | json-format
+loam.json-format() {
+  # [[ ! -p /dev/stdin ]] && { _error "json-format: No input piped from stdin."; return $_E_USG; } # Optional: strict check
+
+  local _formatter_cmd=""
+  if command -v jq &>/dev/null; then _formatter_cmd="jq .";
+  elif command -v python3 &>/dev/null; then _formatter_cmd="python3 -m json.tool";
+  elif command -v python &>/dev/null; then _formatter_cmd="python -m json.tool";
+  else _error "json-formatter (jq, python3, python) not found."; return $_E_DEP; fi
+  
+  eval "$_formatter_cmd" # Reads from stdin by default
+  return $?
+}
+
+# info: pretty-print XML from stdin to stdout
+# usage: <input> | xml-format
+loam.xml-format() {
+  # [[ ! -p /dev/stdin ]] && { _error "xml-format: No input piped from stdin."; return $_E_USG; } # Optional
+
+  if ! command -v xmllint &>/dev/null; then _error "xmllint not found"; return $_E_DEP; fi
+  xmllint --format - # '-' means read from stdin
+  return $?
+}
+
+# info: encode data from stdin or string argument to base64 on stdout
+# usage: base64-encode [string_to_encode] or <input> | base64-encode
+loam.base64-encode() {
+  # -h not supported because it accepts piped input
+  command -v base64 &>/dev/null || { _error "base64 not found"; return $_E_DEP; }
+
+  if [[ $# -gt 0 ]]; then # String argument provided
+    printf "%s" ${1-} | base64
+  elif [[ ! -p /dev/stdin ]]; then
+    echo "usage: base64-encode [string_to_encode] or <input> | base64-encode" >&2; return $_E_USG
+  else # Piped stdin
+    base64
+  fi
+  return $?
+}
+
+# info: decode base64 data from stdin or string argument to stdout
+# usage: base64-decode [base64_string_to_decode] or <input> | base64-decode
+loam.base64-decode() {
+  # -h not supported because it accepts piped input
+  local _decoder="" _os_type; _os_type="$(os)"
+  if [[ "$_os_type" == "mac" ]]; then
+    if command -v gbase64 &>/dev/null; then _decoder="gbase64 --decode";
+    elif (echo "dGVzdA==" | command base64 -d /dev/null &>/dev/null 2>&1); then _decoder="base64 -d";
+    elif command -v base64 &>/dev/null; then _decoder="base64 -D"; fi
+  else
+    if command -v base64 &>/dev/null; then _decoder="base64 --decode"; fi
+  fi
+
+  if [[ -z "$_decoder" ]]; then
+    _error "base64 (decoder) not found for OS '$_os_type'."; return $_E_DEP
+  fi
+  
+  if [[ $# -gt 0 ]]; then # String argument provided
+    # Clean whitespace from argument string before decoding
+    printf "%s" ${1-} | tr -d '\n\r[:space:]' | eval "$_decoder"
+  elif [[ ! -p /dev/stdin ]]; then
+   echo "usage: base64-decode [base64_string_to_decode] or <input> | base64-decode" >&2; return $_E_USG
+  else # Piped stdin - ssume piped stdin is clean or should be processed as-is by base64 decode
+    eval "$_decoder"
+  fi
+  return $?
+}
+##] encoding
+##) functions
+
+##( finalize
+# Restore previous errexit state
+(( _prev_errexit_status )) && set -e || set +e
+
+# This block runs if the script is executed directly (e.g., ./radix) not when sourced (e.g., source "radix")
+if [[ "${ZSH_EVAL_CONTEXT:-}" == "toplevel" ]] || [[ "${ZSH_EVAL_CONTEXT:-}" == "cmdarg" ]]; then
+  _log "radix script executed directly."
+  echo "Radix Utility Library. Source this file (e.g., 'source radix'), do not execute it directly for library use."
+  echo "Debug mode is currently: $_RDEBUG (controlled by ZSH_DEBUG env var)"
+fi
+
+[[ "${ZSH_DEBUG:-}" == "true" ]] && echo "[debug] loaded : radix" >&2
+# this is needed because of set -e
+return 0
+##) finalize
