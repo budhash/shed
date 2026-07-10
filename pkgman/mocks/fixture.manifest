@@ -1,0 +1,6 @@
+# name    | handler | desc          | params                              | tags
+alpha     | script  | mock A        | source=./mocks/mock-pkg!name=alpha  |
+beta      | script  | mock B        | source=./mocks/mock-pkg!name=beta   | mac,macmini
+gamma     | script  | mock C        | source=./mocks/mock-pkg!name=gamma  | mac,laptop
+delta     | brew    | not for v-run | version=9.9.9                       | linux
+epsilon   | script  | mock E        | source=./mocks/mock-pkg!name=epsilon!version=1.2.3 |

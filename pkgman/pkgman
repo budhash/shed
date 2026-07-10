@@ -109,6 +109,7 @@ readonly PKGMAN_DEFAULT_SCOPE="$PKGMAN_SCOPE_CORE"
 # Global flags
 _DRY_RUN=false
 _NO_TRACK=false
+_HOST=""
 
 # Status constants
 readonly _PKGMAN_STATUS_INSTALLED="installed"
@@ -153,6 +154,15 @@ _main() {
         _NO_TRACK=true
         shift
         ;;
+      --host)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--host requires a value"; exit $_E_USG; }
+        _HOST="$2"
+        shift 2
+        ;;
+      --host=*)
+        _HOST="${1#*=}"
+        shift
+        ;;
       -h|--help) _help; exit 0 ;;
       -v|--version) _version; exit 0 ;;
       *) _args+=("$1"); shift ;;
@@ -186,7 +196,15 @@ _main() {
   case "$_command" in
     # Package operations
     add) _cmd_add "$@" ;;
-    install) _cmd_install "$@" ;;
+    install)
+      if [[ -f "${1:-}" ]]; then
+        # Manifest mode: <path> is an existing file, not a tracked package name
+        [[ -n "$_HOST" ]] || { u.error "--host required for manifest mode (install <manifest> --host <h>)"; exit $_E_USG; }
+        _manifest_apply "$1" "$(loam.os)" "$_HOST" install
+        exit $?
+      fi
+      _cmd_install "$@"
+      ;;
     update) _cmd_update "$@" ;;
     uninstall) _cmd_uninstall "$@" ;;
     remove) _cmd_remove "$@" ;;
@@ -409,6 +427,90 @@ _tags_match() {  # $1=tags $2=os $3=host ; return 0 if row applies
     case "$_t" in *,"$_os",*) ;; *) return 1;; esac ;; esac
   case "$_t" in *,laptop,*|*,macmini,*|*,server,*)
     case "$_t" in *,"$_host",*) ;; *) return 1;; esac ;; esac
+  return 0
+}
+
+##@ Strip leading/trailing whitespace from a string, preserving internal whitespace
+##@ Usage: _trimmed="$(_manifest_trim "$_raw")"
+_manifest_trim() {
+  local _s="${1:-}"
+  _s="${_s#"${_s%%[![:space:]]*}"}"
+  _s="${_s%"${_s##*[![:space:]]}"}"
+  printf '%s' "$_s"
+}
+
+##@ Apply a manifest file: add (if untracked) and install (if missing) every
+##@ row whose tags match the given os/host. Lock-ignorant: params (including
+##@ version=) flow through as ordinary --key=value kwargs, no special handling.
+##@ Row grammar: name|handler|desc|params|tags ; params are k=v pairs joined
+##@ by '!' or ';'. '#'-comments and blank lines are skipped. Unknown handlers
+##@ warn and skip the row rather than aborting the whole manifest.
+##@ Usage: _manifest_apply <file> <os> <host> <mode=install>
+_manifest_apply() {
+  local _file="$1" _os="$2" _host="$3" _mode="${4:-install}"
+  [[ -f "$_file" ]] || { u.error "manifest not found: $_file"; return $_E_NF; }
+  [[ "$_mode" == "install" ]] || { u.error "manifest: unsupported mode '$_mode'"; return $_E_USG; }
+
+  local _name _handler _desc _params _tags
+  local _applied=0 _skipped_tags=0 _skipped_handler=0
+  while IFS='|' read -r _name _handler _desc _params _tags; do
+    _name="$(_manifest_trim "${_name:-}")"
+    [[ -z "$_name" ]] && continue
+    case "$_name" in \#*) continue ;; esac
+
+    _handler="$(_manifest_trim "${_handler:-}")"
+    _desc="$(_manifest_trim "${_desc:-}")"
+    _params="$(_manifest_trim "${_params:-}")"
+    _tags="$(_manifest_trim "${_tags:-}")"
+
+    if ! _tags_match "$_tags" "$_os" "$_host" </dev/null; then
+      _skipped_tags=$((_skipped_tags + 1))
+      continue
+    fi
+
+    local _normalized_handler
+    _normalized_handler="$(_normalize_and_validate_manager "$_handler" 2>/dev/null </dev/null)" || {
+      u.warn "manifest: unknown handler '$_handler' for $_name - skipping row"
+      _skipped_handler=$((_skipped_handler + 1))
+      continue
+    }
+
+    # params: k=v pairs joined by '!' or ';' -> --k=v kwargs, passed through as-is.
+    # No special handling for any key (including version=) - pkgman stays
+    # lock-ignorant. Relative source= paths resolve the same way `add` already
+    # resolves them (via pkglib's resolve-source-path search, cwd-relative as
+    # a last resort) - see report for why manifest-dir-relative rewriting was
+    # rejected: the fixture's source= is intentionally cwd-relative.
+    local _kv_arr=() _kwargs=() _p _key _val
+    if [[ -n "$_params" ]]; then
+      # here-string already isolates this read's stdin from the manifest fd;
+      # `|| true` guards against set -e since read's status isn't meaningful here
+      IFS='!;' read -r -a _kv_arr <<< "$_params" || true
+    fi
+    for _p in "${_kv_arr[@]+"${_kv_arr[@]}"}"; do
+      [[ -z "$_p" ]] && continue
+      _key="${_p%%=*}"
+      _val="${_p#*=}"
+      _kwargs+=("--${_key}=${_val}")
+    done
+
+    if ! _is_tracked "$_name" </dev/null; then
+      local _add_args=(--detail "${_desc:-$_name}")
+      [[ -n "$_tags" ]] && _add_args+=(--tags "$_tags")
+      _add_args+=("${_kwargs[@]+"${_kwargs[@]}"}")
+      if ! _cmd_add "$_normalized_handler" "$_name" "${_add_args[@]+"${_add_args[@]}"}" </dev/null; then
+        u.warn "manifest: add failed for $_name - skipping row"
+        continue
+      fi
+    fi
+
+    if [[ "$(_get_package_status "$_name" </dev/null)" != "$_PKGMAN_STATUS_INSTALLED" ]]; then
+      _cmd_install "$_name" </dev/null || u.warn "manifest: install failed for $_name"
+    fi
+    _applied=$((_applied + 1))
+  done < "$_file"
+
+  u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler)"
   return 0
 }
 
@@ -1839,6 +1941,8 @@ COMMANDS:
     add <manager> <package> [--source=<value>] [--dest=<path>] [--artifact=<name>] [--scope=<scope>] [--key=value...]
                                         Add package to tracking with metadata
     install <package> [--force]         Install tracked package using stored metadata
+    install <manifest> --host <h>       Ingest a manifest: add (if untracked) + install
+                                        (if missing) every tags-matching row
     update <package> [--force]          Update tracked package using stored metadata
     uninstall <package> [--force]       Uninstall tracked package but preserve metadata
     remove <package> [--force]          Remove package from tracking completely
@@ -1862,6 +1966,7 @@ GLOBAL OPTIONS:
     -r, --dry-run       Preview actions without making changes
     --dry-run=cmd       Skip package operations but update state files (for testing)
     --no-track          Disable state tracking (for one-off operations)
+    --host <h>          Target host tag for manifest mode (REQUIRED with install <manifest>)
     -h, --help          Show this help
     -v, --version       Show version
 

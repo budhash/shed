@@ -147,4 +147,38 @@ test_dmg_handler_delegates() {
   done
 }
 
+test_manifest_install() {
+  _section_header "P1: manifest ingestion (install mode)"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+
+  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "manifest install runs"
+  assert_file_exists "$MOCK_STATE/alpha"   "untagged row installed"
+  assert_file_exists "$MOCK_STATE/beta"    "matching host row installed"
+  assert_file_exists "$MOCK_STATE/epsilon" "untagged row with version= kwarg installed"
+  assert_ok test ! -f "$MOCK_STATE/gamma" "laptop-tagged row filtered out"
+  assert_ok test ! -f "$MOCK_STATE/delta" "linux-tagged row filtered out on mac"
+
+  assert_ok grep -q '^beta.tags=mac,macmini' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "tags persisted"
+  assert_ok grep -q '^beta.manager=script' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "manager metadata persisted"
+  assert_ok grep -q '^epsilon.version=1.2.3' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "applicable row's version= kwarg lands in the index"
+  assert_ok grep -q '^beta.install_method=pkgman' "$PKGMAN_CONFIG_DIR/status.cfg" "install_method=pkgman recorded"
+  assert_ok grep -q '^beta.status=installed' "$PKGMAN_CONFIG_DIR/status.cfg" "status=installed recorded"
+
+  # idempotent second pass: already-tracked/installed rows are left alone, no failure
+  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "second pass clean"
+  assert_ok grep -q '^beta.status=installed' "$PKGMAN_CONFIG_DIR/status.cfg" "status remains installed after second pass"
+  assert_contains "$($TOOL status beta 2>&1)" "installed" "status command still sees beta as installed"
+
+  # unknown handler in a row warns + skips rather than aborting the manifest
+  local _bad; _bad=$(mktemp "${TMPDIR:-/tmp}/bad-manifest-XXXXXX")
+  printf 'zzz | not-a-real-handler | bogus | | \nalpha2 | script | mock A2 | source=./mocks/mock-pkg!name=alpha2 | \n' > "$_bad"
+  assert_ok $TOOL install "$_bad" --host macmini "manifest with unknown handler row still exits 0"
+  assert_file_exists "$MOCK_STATE/alpha2" "valid row after unknown-handler row still installed"
+  rm -f "$_bad"
+
+  # --host required for manifest mode
+  assert_fail $TOOL install ./mocks/fixture.manifest "manifest without --host fails"
+}
+
 _test_runner
