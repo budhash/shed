@@ -98,7 +98,7 @@ readonly PKGMAN_MANAGERS=(brew apt dnf github download mas script cargo go pipx 
 readonly PKGMAN_OPERATIONS=(validate install update uninstall status)
 
 # Core metadata fields (excluded from kwargs extraction)
-readonly PKGMAN_CORE_METADATA=(manager source dest artifact channel scope os sudo detail)
+readonly PKGMAN_CORE_METADATA=(manager source dest artifact channel scope os sudo detail tags)
 
 # Scope constants
 readonly PKGMAN_SCOPE_CORE="core"
@@ -207,6 +207,8 @@ _main() {
     # System
     help) _help; exit 0 ;;
     version) _version; exit 0 ;;
+    # Hidden test-only command: exposes _tags_match without needing to source pkgman
+    __tags-match) _tags_match "$@"; exit $? ;;
     *) u.error "unknown command: $_command"; _help; exit $_E_USG ;;
   esac
 }
@@ -392,6 +394,21 @@ _validate_os_compatibility() {
     return $_E_OS
   fi
   
+  return 0
+}
+
+##@ Check whether a package's tags allow it to apply on the given os/host
+##@ Empty tags always match. Tags containing mac|linux require that os to match;
+##@ tags containing laptop|macmini|server require that host to match. Host is
+##@ ALWAYS passed in by the caller (--host) - never derived from the local machine.
+##@ Usage: _tags_match "$_tags" "$_os" "$_host" || continue
+_tags_match() {  # $1=tags $2=os $3=host ; return 0 if row applies
+  local _t=",${1// /}," _os="$2" _host="$3"
+  [[ "$_t" == ",," ]] && return 0
+  case "$_t" in *,mac,*|*,linux,*)
+    case "$_t" in *,"$_os",*) ;; *) return 1;; esac ;; esac
+  case "$_t" in *,laptop,*|*,macmini,*|*,server,*)
+    case "$_t" in *,"$_host",*) ;; *) return 1;; esac ;; esac
   return 0
 }
 
@@ -1215,6 +1232,7 @@ _cmd_add() {
   local _source="default" _dest="default" _artifact="default" _scope="$PKGMAN_DEFAULT_SCOPE"
   local _os="default" _sudo="false" _detail="" _channel="default"
   local _param_install="" _param_update="" _param_uninstall="" _param_sync=""
+  local _kwargs_keys=() _kwargs_values=()
   
   # Parse optional parameters
   while [[ $# -gt 0 ]]; do
@@ -1332,22 +1350,30 @@ _cmd_add() {
     return $_E  # Other error
   }
   
-  # Route to managers with unified signature (8 core params + 4 param.* params = 12 total)
+  # Route to managers with unified signature (8 core params + 4 param.* params = 12 total),
+  # followed by any --key=value kwargs forwarded as N keys then N values so
+  # _cmd_add_unified can re-split them (bash 3.2: no namerefs/assoc arrays).
   u.debug "add_unified - manager=$_manager, package=$_package, source=$_source, dest=$_dest, artifact=$_artifact, channel=$_channel, os=$_os, sudo=$_sudo, param.install=$_param_install, param.update=$_param_update, param.uninstall=$_param_uninstall, param.sync=$_param_sync"
-  _cmd_add_unified "$_manager" "$_package" "$_source" "$_dest" "$_artifact" "$_channel" "$_os" "$_sudo" "$_param_install" "$_param_update" "$_param_uninstall" "$_param_sync"
+  _cmd_add_unified "$_manager" "$_package" "$_source" "$_dest" "$_artifact" "$_channel" "$_os" "$_sudo" "$_param_install" "$_param_update" "$_param_uninstall" "$_param_sync" "${_kwargs_keys[@]+"${_kwargs_keys[@]}"}" "${_kwargs_values[@]+"${_kwargs_values[@]}"}"
 }
 
 ##@ Unified add handler for all managers with consistent parameter interface
-##@ Parameters: manager package source dest artifact scope os sudo detail [kwargs_keys...] [kwargs_values...]
+##@ Parameters (12 fixed): manager package source dest artifact channel os sudo
+##@   param.install param.update param.uninstall param.sync, followed by any
+##@   forwarded --key=value kwargs as [kwargs_keys...] [kwargs_values...]
 _cmd_add_unified() {
-  # Validate exact parameter count (12 expected)
-  [[ $# -eq 12 ]] || { u.error "_cmd_add_unified expects exactly 12 parameters, got $#"; return $_E; }
-  
+  # Validate parameter count: 12 fixed params, plus an even number of trailing
+  # kwargs (N keys followed by N values, forwarded by _cmd_add)
+  [[ $# -ge 12 ]] || { u.error "_cmd_add_unified expects at least 12 parameters, got $#"; return $_E; }
+  local _kwargs_argc=$(( $# - 12 ))
+  [[ $(( _kwargs_argc % 2 )) -eq 0 ]] || { u.error "_cmd_add_unified expects matching kwargs keys/values counts, got $_kwargs_argc trailing args"; return $_E; }
+
   local _manager="$1" _package="$2" _source="$3" _dest="$4" _artifact="$5" _channel="$6" _os="$7" _sudo="$8" _param_install="$9" _param_update="${10}" _param_uninstall="${11}" _param_sync="${12}"
-  
-  # Split remaining args into keys and values arrays (bash 3.2 compatible)
-  local _argc=$#
-  local _half=$((_argc / 2))
+  shift 12
+
+  # Split the forwarded kwargs (everything past the 12 fixed params) into keys
+  # and values arrays (bash 3.2 compatible)
+  local _half=$(( $# / 2 ))
   local _kwargs_keys=() _kwargs_values=() _i=0
   
   # Extract keys (first half)

@@ -38,15 +38,43 @@ test_add_and_install() {
   _section_header "P0: add + install via script handler"
   setup_cfg
   export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
-  # --name=demo exercises the generic --key=value kwarg parser (must not crash the
-  # add command), but a pre-existing, out-of-scope bug in _cmd_add_unified never
-  # forwards kwargs on to pkglib, so the mock still falls back to its own default
-  # name ("mock-pkg") for the marker file.
+  # --name=demo exercises the generic --key=value kwarg parser and must actually
+  # flow through to pkglib: _cmd_add parses it into _kwargs_keys/_kwargs_values but
+  # was never forwarding them to _cmd_add_unified, which re-split ITS OWN 12 fixed
+  # params instead, writing bogus metadata (demo.script=default, demo.demo=false).
+  # Now repaired: kwargs are forwarded and demo.name=demo lands in the index, so the
+  # mock receives --name=demo and creates its marker as "demo" (not "mock-pkg").
   assert_ok $TOOL add script demo --source "$PWD/mocks/mock-pkg" --detail "demo pkg" --name=demo "add succeeds"
   assert_ok grep -q '^demo.manager=script' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "metadata written to index"
+  assert_ok grep -q '^demo.name=demo' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "kwarg metadata forwarded correctly"
+  assert_fail grep -q '^demo.script=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "no bogus demo.script metadata"
+  assert_fail grep -q '^demo.demo=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "no bogus demo.demo metadata"
   assert_ok $TOOL install demo "install runs the mock"
-  assert_file_exists "$MOCK_STATE/mock-pkg" "mock marker created"
+  assert_file_exists "$MOCK_STATE/demo" "mock marker created with forwarded --name"
   assert_contains "$($TOOL status demo 2>&1)" "installed" "status sees installed"
+}
+
+test_tags_matcher() {
+  _section_header "tag filter semantics"
+  # assert_ok/assert_fail treat all-but-last args as an argv array (not a shell
+  # string to re-parse), so each case is passed as separate unquoted tokens.
+  assert_ok   $TOOL __tags-match ''               mac macmini "empty tags match all"
+  assert_ok   $TOOL __tags-match 'mac,linux'      mac macmini "os tag matches"
+  assert_fail $TOOL __tags-match 'linux'          mac macmini "wrong os rejected"
+  assert_ok   $TOOL __tags-match 'mac,macmini'    mac macmini "host tag matches"
+  assert_fail $TOOL __tags-match 'mac,laptop'     mac macmini "wrong host rejected"
+  assert_ok   $TOOL __tags-match 'laptop,macmini' mac macmini "multi-host includes ours"
+  assert_eq 0 "$(grep -cE '(^|[^A-Za-z_])hostname([^A-Za-z_-]|$)' ./pkgman)" "no hostname derivation in pkgman"
+}
+
+test_tags_metadata() {
+  _section_header "tags metadata flows into index"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+  assert_ok $TOOL add script tagged --source "$PWD/mocks/mock-pkg" --detail "tagged pkg" --tags=mac,laptop "add with tags succeeds"
+  assert_ok grep -q '^tagged.tags=mac,laptop' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "tags metadata written to index"
+  assert_ok $TOOL list-all "list-all still works"
+  assert_ok $TOOL info tagged "info still works"
 }
 
 test_download_status_precedence() {
