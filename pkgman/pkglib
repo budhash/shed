@@ -1558,8 +1558,12 @@ pkglib.download.status() {
   else
     _target="$_dest/$_name"
   fi
-  
-  [[ -f "$_target" ]] || [[ -d "$_target" ]] && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+
+  if [[ -f "$_target" || -d "$_target" ]]; then
+    echo "$_PKGLIB_STATUS_INSTALLED"
+  else
+    echo "$_PKGLIB_STATUS_MISSING"
+  fi
   return 0
 }
 ##] download

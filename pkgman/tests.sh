@@ -49,6 +49,17 @@ test_add_and_install() {
   assert_contains "$($TOOL status demo 2>&1)" "installed" "status sees installed"
 }
 
+test_download_status_precedence() {
+  _section_header "pkglib.download.status: file/dir/missing"
+  source ./pkglib
+  local d; d=$(mktemp -d "${TMPDIR:-/tmp}/dl-XXXXXX")
+  touch "$d/f"; mkdir "$d/dir"
+  assert_eq "installed" "$(pkglib.download.status f false --dest="$d" --artifact=f)"    "file → installed"
+  assert_eq "installed" "$(pkglib.download.status dir false --dest="$d" --artifact=dir)" "dir → installed"
+  assert_eq "missing"   "$(pkglib.download.status nope false --dest="$d" --artifact=nope)" "absent → missing"
+  rm -rf "$d"
+}
+
 test_smoke_all_subcommands() {
   _section_header "P0: --dry-run=cmd smoke across the router"
   setup_cfg
