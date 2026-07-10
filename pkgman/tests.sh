@@ -6,6 +6,36 @@ set -euo pipefail
 source ../.common/test-common
 NAME="pkgman"; TOOL="./pkgman"
 
+# CI insurance: no descendant process may ever block reading this suite's stdin
+# (same failure class as a read-loop eating input — a hung child shows up as a
+# killed CI job with truncated logs).
+exec </dev/null
+
+# TEMPORARY CI DIAGNOSTIC (remove after the macOS-lane kill is found): trace every
+# section + exit into a file that ci.yml dumps in an always() step, immune to the
+# stdout truncation seen when the job dies.
+PKGTRACE="${PKGTRACE:-/tmp/pkgman-trace.log}"
+: > "$PKGTRACE" || PKGTRACE=/dev/null
+echo "SUITE START $(date +%s) bash=$BASH_VERSION" >> "$PKGTRACE"
+trap 'echo "SUITE EXIT code=$? at ${FUNCNAME[0]:-main}" >> "$PKGTRACE"' EXIT
+_section_header() {
+  echo "SECTION: ${1:-?} $(date +%s)" >> "$PKGTRACE"
+  # shellcheck disable=SC2154  # _BLU/_RST are assigned by ../.common/test-common at source time
+  echo -e "${_BLU}Testing: ${1:-?}${_RST}"
+}
+
+# Platform-parameterized fixtures: the committed mocks/fixture*.manifest are
+# mac-flavored EXAMPLES. CI also runs on linux, where mac-tagged rows are
+# (correctly) filtered by _tags_match — so mac-hardcoded expectations fail there.
+# Tests therefore use generated copies carrying THIS platform's os tag, and the
+# OTHER platform's tag for the row that must be filtered out (delta).
+THIS_OS=$([ "$(uname)" = "Darwin" ] && echo mac || echo linux)
+OTHER_OS=$([ "$THIS_OS" = "mac" ] && echo linux || echo mac)
+FIX_A=$(mktemp "${TMPDIR:-/tmp}/fixture-a-XXXXXX")
+FIX_B=$(mktemp "${TMPDIR:-/tmp}/fixture-b-XXXXXX")
+sed -e "s/| mac,/| ${THIS_OS},/" -e "s/| linux[[:space:]]*\$/| ${OTHER_OS}/" ./mocks/fixture.manifest > "$FIX_A"
+grep -v '^beta ' "$FIX_A" > "$FIX_B"
+
 test_pkglib_loads() {
   _section_header "pkglib sources + full handler matrix"
   assert_ok bash -n ./pkglib "pkglib syntax"
@@ -152,21 +182,21 @@ test_manifest_install() {
   setup_cfg
   export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
 
-  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "manifest install runs"
+  assert_ok $TOOL install "$FIX_A" --host macmini "manifest install runs"
   assert_file_exists "$MOCK_STATE/alpha"   "untagged row installed"
   assert_file_exists "$MOCK_STATE/beta"    "matching host row installed"
   assert_file_exists "$MOCK_STATE/epsilon" "untagged row with version= kwarg installed"
   assert_ok test ! -f "$MOCK_STATE/gamma" "laptop-tagged row filtered out"
   assert_ok test ! -f "$MOCK_STATE/delta" "linux-tagged row filtered out on mac"
 
-  assert_ok grep -q '^beta.tags=mac,macmini' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "tags persisted"
+  assert_ok grep -q "^beta.tags=${THIS_OS},macmini" "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "tags persisted"
   assert_ok grep -q '^beta.manager=script' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "manager metadata persisted"
   assert_ok grep -q '^epsilon.version=1.2.3' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "applicable row's version= kwarg lands in the index"
   assert_ok grep -q '^beta.install_method=pkgman' "$PKGMAN_CONFIG_DIR/status.cfg" "install_method=pkgman recorded"
   assert_ok grep -q '^beta.status=installed' "$PKGMAN_CONFIG_DIR/status.cfg" "status=installed recorded"
 
   # idempotent second pass: already-tracked/installed rows are left alone, no failure
-  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "second pass clean"
+  assert_ok $TOOL install "$FIX_A" --host macmini "second pass clean"
   assert_ok grep -q '^beta.status=installed' "$PKGMAN_CONFIG_DIR/status.cfg" "status remains installed after second pass"
   assert_contains "$($TOOL status beta 2>&1)" "installed" "status command still sees beta as installed"
 
@@ -178,14 +208,14 @@ test_manifest_install() {
   rm -f "$_bad"
 
   # --host required for manifest mode
-  assert_fail $TOOL install ./mocks/fixture.manifest "manifest without --host fails"
+  assert_fail $TOOL install "$FIX_A" "manifest without --host fails"
 }
 
 test_sync_prune() {
   _section_header "P1: sync --prune converges, never touches manual"
   setup_cfg
   export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
-  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "manifest install runs (alpha+beta+epsilon in)"
+  assert_ok $TOOL install "$FIX_A" --host macmini "manifest install runs (alpha+beta+epsilon in)"
   assert_ok $TOOL add script manual1 --source "$PWD/mocks/mock-pkg" --detail m --name=manual1 "manual1 tracked add-only (never installed via pkgman)"
 
   # Honest precondition (the brief assumes add-only => literal install_method=manual;
@@ -196,33 +226,33 @@ test_sync_prune() {
   assert_fail grep -q '^manual1.install_method=pkgman' "$PKGMAN_CONFIG_DIR/status.cfg" "manual1 precondition: not install_method=pkgman"
 
   # sync manifest-B (beta row removed): report-only without --prune
-  local out; out=$($TOOL sync ./mocks/fixture-b.manifest --host macmini 2>&1)
+  local out; out=$($TOOL sync "$FIX_B" --host macmini 2>&1)
   assert_contains "$out" "beta" "undeclared beta reported"
   assert_file_exists "$MOCK_STATE/beta" "beta NOT removed without --prune"
   assert_ok grep -q '^beta.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "beta still tracked without --prune"
 
   # --dry-run --prune: prints the plan, performs no removal
-  local dryout; dryout=$($TOOL sync ./mocks/fixture-b.manifest --host macmini --prune --dry-run 2>&1)
+  local dryout; dryout=$($TOOL sync "$FIX_B" --host macmini --prune --dry-run 2>&1)
   assert_contains "$dryout" "beta" "dry-run prune plan mentions beta"
   assert_file_exists "$MOCK_STATE/beta" "beta NOT removed under --dry-run --prune"
   assert_ok grep -q '^beta.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "beta still tracked under --dry-run --prune"
 
   # real prune, --force skips the confirm: beta uninstalled + untracked; alpha + manual1 untouched
-  assert_ok $TOOL sync ./mocks/fixture-b.manifest --host macmini --prune --force "prune runs"
+  assert_ok $TOOL sync "$FIX_B" --host macmini --prune --force "prune runs"
   assert_ok test ! -f "$MOCK_STATE/beta" "beta uninstalled"
   assert_fail grep -q '^beta.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "beta untracked"
   assert_file_exists "$MOCK_STATE/alpha" "alpha survives"
   assert_ok grep -q '^manual1.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "manual package never pruned"
 
   # sync <manifest> without --host fails, same contract as install <manifest>
-  assert_fail $TOOL sync ./mocks/fixture-b.manifest "sync manifest without --host fails"
+  assert_fail $TOOL sync "$FIX_B" "sync manifest without --host fails"
 }
 
 test_sync_prune_typo_handler_fails_safe() {
   _section_header "P1: sync --prune - typo'd handler still declares its package (fails safe)"
   setup_cfg
   export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
-  assert_ok $TOOL install ./mocks/fixture.manifest --host macmini "manifest install runs (alpha+beta+epsilon in)"
+  assert_ok $TOOL install "$FIX_A" --host macmini "manifest install runs (alpha+beta+epsilon in)"
   assert_file_exists "$MOCK_STATE/alpha" "alpha installed before the typo'd re-sync"
 
   # Same rows as fixture.manifest, but alpha's handler is typo'd ('scritp' for
@@ -231,13 +261,10 @@ test_sync_prune_typo_handler_fails_safe() {
   # it), but _manifest_declared_names must still count alpha as declared, so
   # prune leaves the already-installed/tracked package alone.
   local _typo; _typo=$(mktemp "${TMPDIR:-/tmp}/typo-manifest-XXXXXX")
-  cat > "$_typo" <<'EOF'
-alpha     | scritp  | mock A        | source=./mocks/mock-pkg!name=alpha  |
-beta      | script  | mock B        | source=./mocks/mock-pkg!name=beta   | mac,macmini
-gamma     | script  | mock C        | source=./mocks/mock-pkg!name=gamma  | mac,laptop
-delta     | brew    | not for v-run | version=9.9.9                       | linux
-epsilon   | script  | mock E        | source=./mocks/mock-pkg!name=epsilon!version=1.2.3 |
-EOF
+  # Same rows as the generated FIX_A, but alpha's handler typo'd — derive from
+  # FIX_A so the os tags stay platform-correct (see the fixture note at the top).
+  sed 's/^alpha \([ ]*\)| script /alpha \1| scritp /' "$FIX_A" > "$_typo"
+  assert_ok grep -q '| scritp ' "$_typo" "typo fixture sanity: alpha handler is typo'd"
 
   local out; out=$($TOOL sync "$_typo" --host macmini --prune --force 2>&1)
   assert_contains "$out" "unknown handler" "apply still warns about the typo'd handler"

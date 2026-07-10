@@ -58,7 +58,11 @@ jobs:
         
     - name: Run all tests
       run: make test
-      
+
+    - name: Dump pkgman trace (temporary diagnostic)
+      if: always()
+      run: cat /tmp/pkgman-trace.log 2>/dev/null || echo "(no trace file)"
+
     - name: Test summary
       if: always()
       run: |
