@@ -35,9 +35,12 @@ lint:
 		echo "Linting tools from tools.txt..."; \
 		grep -v '^#' tools.txt | grep -v '^[[:space:]]*$$' | cut -d: -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$$//' | grep -v '.template' | \
 		while read -r tool; do \
-			echo "Linting $$tool/$$tool"; \
-			shellcheck "$$tool/$$tool"; \
+			base=$$(basename "$$tool"); \
+			echo "Linting $$tool/$$base"; \
+			shellcheck "$$tool/$$base"; \
 		done; \
+		echo "Linting pkgman extras"; \
+		shellcheck pkgman/pkglib pkgman/pkgboot; \
 		echo "Linting completed"; \
 	else \
 		echo "shellcheck not found. Install with: brew install shellcheck (macOS) or apt install shellcheck (Ubuntu)"; \

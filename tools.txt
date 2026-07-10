@@ -4,3 +4,5 @@
 sem-ver:Semantic version bumping and management
 git-tag:Git tag management with semantic versioning
 ver-kit:Universal version extraction and update toolkit
+pkgman:Universal package manager CLI (stateful wrapper over pkglib)
+lib/common/loam:Generic bash stdlib (log/fs/os/download) used by shed tools and radix
