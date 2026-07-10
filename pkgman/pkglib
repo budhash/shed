@@ -3,9 +3,9 @@
 # --------------------------------------------------------------------
 # pkglib - Universal package/software management library
 #
-# Stateless library providing standardized interfaces for package 
+# Stateless library providing standardized interfaces for package
 # installation, updates, removal, and status checking across different
-# package managers and software sources. Uses radix library internally
+# package managers and software sources. Uses loam library internally
 # for cross-platform compatibility and robust file operations.
 #
 # PARAMETER SEMANTICS:

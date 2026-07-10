@@ -246,4 +246,36 @@ EOF
   rm -f "$_typo"
 }
 
+test_manifest_no_trailing_newline_last_row() {
+  _section_header "P1: manifest with NO trailing newline - last row must not be dropped/pruned"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+
+  # `while IFS='|' read ...` silently drops a final line with no trailing
+  # newline unless the loop condition also accepts the last (failed-read)
+  # iteration. Build a manifest with printf '%s' (deliberately NO trailing
+  # newline) whose LAST row is a script-mock package, and prove both that
+  # `install` still installs it and that `sync --prune` never treats it as
+  # undeclared (which would wrongfully uninstall a package that IS in the
+  # file, just on its unterminated last line).
+  local _man; _man=$(mktemp "${TMPDIR:-/tmp}/notrail-manifest-XXXXXX")
+  printf '%s' "alpha9 | script | mock A9 | source=./mocks/mock-pkg!name=alpha9 |
+zzz9   | script | mock Z9 | source=./mocks/mock-pkg!name=zzz9   |" > "$_man"
+  assert_ok test -n "$(tail -c1 "$_man")" "fixture sanity: manifest has no trailing newline"
+
+  assert_ok $TOOL install "$_man" --host macmini "install runs against no-trailing-newline manifest"
+  assert_file_exists "$MOCK_STATE/alpha9" "first (newline-terminated) row installed"
+  assert_file_exists "$MOCK_STATE/zzz9" "last (unterminated) row installed - not dropped by read"
+  assert_ok grep -q '^zzz9.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "last row's package tracked in the index"
+
+  # Now sync --prune --force against the SAME no-trailing-newline file. zzz9
+  # IS declared (it's the last line) so it must survive prune.
+  assert_ok $TOOL sync "$_man" --host macmini --prune --force "sync --prune runs against no-trailing-newline manifest"
+  assert_file_exists "$MOCK_STATE/zzz9" "last (unterminated) row NOT pruned - still declared"
+  assert_ok grep -q '^zzz9.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "last row's package still tracked after sync --prune"
+  assert_file_exists "$MOCK_STATE/alpha9" "first row also survives prune"
+
+  rm -f "$_man"
+}
+
 _test_runner

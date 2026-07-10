@@ -136,7 +136,7 @@ pkgman install ~/my-packages.manifest --host laptop
 
 ### sync <manifest> --host <hostname> [--prune] [--force] [--dry-run]
 
-Reconcile system state with manifest. Installs missing, updates outdated, removes undeclared (with `--prune`).
+Reconcile system state with manifest. Installs missing, removes undeclared (with `--prune`). Does not update already-installed packages (lock-ignorant).
 
 - By default: plan-only (shows what would change); confirm once unless `--force`.
 - `--dry-run`: report without acting.

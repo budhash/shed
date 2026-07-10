@@ -476,7 +476,7 @@ _manifest_apply() {
 
   local _name _handler _desc _params _tags
   local _applied=0 _skipped_tags=0 _skipped_handler=0
-  while IFS='|' read -r _name _handler _desc _params _tags; do
+  while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
     _name="$(_manifest_trim "${_name:-}")"
     [[ -z "$_name" ]] && continue
     case "$_name" in \#*) continue ;; esac
@@ -549,7 +549,7 @@ _manifest_apply() {
 _manifest_declared_names() {  # $1=file $2=os $3=host -> applicable names, one per line
   local _file="$1" _os="$2" _host="$3"
   local _name _handler _desc _params _tags
-  while IFS='|' read -r _name _handler _desc _params _tags; do
+  while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
     _name="$(_manifest_trim "${_name:-}")"
     [[ -z "$_name" ]] && continue
     case "$_name" in \#*) continue ;; esac
@@ -583,7 +583,7 @@ _manifest_sync() {
   local _pkg _undeclared=()
   for _pkg in "${_core_packages[@]+"${_core_packages[@]}"}"; do
     [[ -z "$_pkg" ]] && continue
-    grep -qx "$_pkg" <<< "$_declared" && continue
+    grep -Fqx "$_pkg" <<< "$_declared" && continue
     local _method="$(_get_status "$_pkg" "$_PKGMAN_FIELD_INSTALL_METHOD" </dev/null)"
     [[ "$_method" == "$_PKGMAN_INSTALL_METHOD_PKGMAN" ]] || continue
     _undeclared+=("$_pkg")
