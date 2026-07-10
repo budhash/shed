@@ -1,6 +1,10 @@
 # Shed - Collection of useful development tools
 # Makefile for common tasks
 
+# Recipes use bash features (here-strings in lint); ubuntu's default /bin/sh is
+# dash and dies with "Syntax error: redirection unexpected" (CI-only failure).
+SHELL := /bin/bash
+
 .PHONY: test help clean lint update-templates
 
 # Default target
