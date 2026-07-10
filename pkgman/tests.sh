@@ -18,6 +18,8 @@ test_pkglib_loads() {
     assert_ok declare -F "pkglib.$m.$o" "pkglib.$m.$o exists"
   done; done
   assert_ok declare -F pkglib.common.install "common template present"
+  assert_ok declare -F pkglib.common.update "common template present"
+  assert_ok declare -F pkglib.common.uninstall "common template present"
 }
 
 _test_runner

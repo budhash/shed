@@ -38,9 +38,7 @@
 # --------------------------------------------------------------------
 ##) header
 
-# shellcheck disable=SC1090 # loam is sourced from a runtime-resolved path ($LOAM or in-repo relative); location can't be known statically
-# shellcheck disable=SC2154 # _E/_E_USG/_E_DEP/_E_NF/_E_NP/_E_OS are defined by loam at source time (see disable=SC1090 above); verified live by tests.sh
-# shellcheck disable=SC2145,SC2207 # pre-existing archived-pkglib patterns (debug-string array interpolation, unquoted command-substitution splitting); out of scope for the loam migration, left as-is from the archive
+# shellcheck disable=SC1090,SC2154 # loam is sourced from a runtime-resolved path ($LOAM or in-repo relative); location can't be known statically. _E/_E_USG/_E_DEP/_E_NF/_E_NP/_E_OS are defined by loam at source time; verified live by tests.sh
 ##( configuration
 # Include guard to prevent multiple sourcing
 [[ -n "${PKGLIB_LOADED:-}" ]] && return 0
@@ -459,11 +457,13 @@ pkglib.brew.execute() {
   esac
   
   # Execute brew command with or without kwargs
-  # Filter out pkgman-specific parameters 
+  # Filter out pkgman-specific parameters
   local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
   _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
 
   if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
     _debug "brew $_command $_name ${_filtered_kwargs[@]}"
     brew "$_command" "$_name" "${_filtered_kwargs[@]}" || { _error "brew $_command failed: $_name"; return $_E; }
   else
@@ -544,15 +544,17 @@ pkglib.apt.execute() {
   esac
   
   # Execute apt command with or without kwargs - respect sudo parameter
-  # Filter out pkgman-specific parameters 
+  # Filter out pkgman-specific parameters
   local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
   _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
-  
+
   # Check if sudo is explicitly requested
   local _use_sudo
   _use_sudo=$(_pkglib.get_arg_opt sudo "false" "$@")
 
   if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
     _debug "apt $_command $_name ${_filtered_kwargs[@]} (sudo: $_use_sudo)"
     if [[ "$_use_sudo" == "true" ]]; then
       sudo apt $_command -y "$_name" "${_filtered_kwargs[@]}" || { _error "apt $_command failed: $_name"; return $_E; }
@@ -640,15 +642,17 @@ pkglib.dnf.execute() {
   esac
   
   # Execute dnf command with or without kwargs - respect sudo parameter
-  # Filter out pkgman-specific parameters 
+  # Filter out pkgman-specific parameters
   local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
   _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
-  
+
   # Check if sudo is explicitly requested
   local _use_sudo
   _use_sudo=$(_pkglib.get_arg_opt sudo "false" "$@")
 
   if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
     _debug "dnf $_command $_name ${_filtered_kwargs[@]} (sudo: $_use_sudo)"
     if [[ "$_use_sudo" == "true" ]]; then
       sudo dnf $_command -y "$_name" "${_filtered_kwargs[@]}" || { _error "dnf $_command failed: $_name"; return $_E; }
@@ -850,12 +854,14 @@ pkglib.cargo.execute() {
   esac
   
   # Execute cargo command with or without kwargs
-  # Filter out pkgman-specific parameters 
+  # Filter out pkgman-specific parameters
   local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
   _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
 
   if [[ -n "${_force_flag:-}" ]]; then
     if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
       _debug "cargo $_command $_force_flag $_source ${_filtered_kwargs[@]}"
       cargo "$_command" "$_force_flag" "$_source" "${_filtered_kwargs[@]}" || { _error "cargo $_command $_force_flag failed: $_name"; return $_E; }
     else
@@ -864,6 +870,7 @@ pkglib.cargo.execute() {
     fi
   else
     if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
       _debug "cargo $_command $_source ${_filtered_kwargs[@]}"
       cargo "$_command" "$_source" "${_filtered_kwargs[@]}" || { _error "cargo $_command failed: $_name"; return $_E; }
     else
@@ -1000,17 +1007,18 @@ pkglib.go.execute() {
   esac
   
   # Execute go command with or without kwargs
-  # Filter out pkgman-specific parameters 
+  # Filter out pkgman-specific parameters
   local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
   _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
 
   if [[ "$_command" == "uninstall" ]]; then
     # Go uninstall is manual - remove the binary (needs artifact/binary name)
     local _gobin="${GOBIN:-$(go env GOPATH)/bin}"
     local _binary_path="$_gobin/$_binary_name"
-    
+
     [[ ! -f "$_binary_path" ]] && { _error "go binary not found: $_binary_path"; return $_E_NF; }
-    
+
     _debug "rm -f $_binary_path"
     rm -f "$_binary_path" || { _error "go uninstall failed: $_name"; return $_E; }
   else
@@ -1020,9 +1028,10 @@ pkglib.go.execute() {
       local _gobin="${GOBIN:-$(go env GOPATH)/bin}"
       [[ -f "$_gobin/$_binary_name" ]] && rm -f "$_gobin/$_binary_name"
     fi
-    
+
     # Install using source (module path) with optional kwargs
     if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
       _debug "go $_command ${_filtered_kwargs[@]} $_source"
       go "$_command" "${_filtered_kwargs[@]}" "$_source" || { _error "go $_command failed: $_name"; return $_E; }
     else
@@ -1112,11 +1121,13 @@ pkglib.pipx.execute() {
   esac
   
   # Execute pipx command with or without kwargs
-  # Filter out pkgman-specific parameters 
+  # Filter out pkgman-specific parameters
   local _filtered_kwargs
+  # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
   _filtered_kwargs=($(_pkglib.filter_kwargs "$@"))
 
   if [[ "$_append_kwargs" == "true" ]] && [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
     _debug "pipx $_command $_source ${_filtered_kwargs[@]}"
     pipx $_command "$_source" "${_filtered_kwargs[@]}" || { _error "pipx $_command failed: $_name"; return $_E; }
   else
@@ -1230,10 +1241,12 @@ pkglib.npm.execute() {
     
     # Filter out npm-specific parameters and get clean kwargs for npm
     local _filtered_kwargs
+    # shellcheck disable=SC2207  # legacy archive pattern, pre-loam
     _filtered_kwargs=($(_pkglib.filter_kwargs --npx --version "$@"))
-    
+
     # Execute npm command with filtered arguments
     if [[ ${#_filtered_kwargs[@]} -gt 0 ]]; then
+      # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
       _debug "npm $_command -g $_package ${_filtered_kwargs[@]}"
       npm "$_command" "-g" "$_package" "${_filtered_kwargs[@]}" || { _error "npm $_command failed: $_name"; return $_E; }
     else
@@ -1589,6 +1602,7 @@ pkglib.script.execute() {
   _exec_args+=("$@")  # Pass all remaining kwargs to the script
   
   # Execute the resolved script with CLI arguments
+  # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
   _debug "$_resolved_source ${_exec_args[@]}"
   "$_resolved_source" "${_exec_args[@]}"
   local _exit_code=$?
