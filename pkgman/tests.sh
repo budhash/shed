@@ -305,4 +305,50 @@ zzz9   | script | mock Z9 | source=./mocks/mock-pkg!name=zzz9   |" > "$_man"
   rm -f "$_man"
 }
 
+test_manifest_optionals() {
+  _section_header "P1: optional rows — skipped by default, selectable, always declared (prune-safe)"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+
+  # one required row + two optional rows, tagged for THIS platform so the suite
+  # is platform-agnostic (see the fixture note at the top of this file).
+  local _m; _m=$(mktemp "${TMPDIR:-/tmp}/opt-manifest-XXXXXX")
+  {
+    printf 'req  | script | required     | source=./mocks/mock-pkg!name=req  | %s\n' "$THIS_OS"
+    printf 'opt1 | script | optional one | source=./mocks/mock-pkg!name=opt1 | %s,optional\n' "$THIS_OS"
+    printf 'opt2 | script | optional two | source=./mocks/mock-pkg!name=opt2 | %s,optional\n' "$THIS_OS"
+  } > "$_m"
+
+  # 1) default: optionals skipped for install; required row installed
+  assert_ok $TOOL install "$_m" --host macmini "install without --install-optionals runs"
+  assert_file_exists "$MOCK_STATE/req"    "required row installed"
+  assert_ok test ! -f "$MOCK_STATE/opt1"  "optional opt1 skipped by default"
+  assert_ok test ! -f "$MOCK_STATE/opt2"  "optional opt2 skipped by default"
+
+  # 2) enumerator lists applicable optional rows with descriptions, excludes non-optional
+  local _lf; _lf=$(mktemp "${TMPDIR:-/tmp}/opt-list-XXXXXX")
+  $TOOL __manifest-optionals "$_m" --host macmini > "$_lf" 2>/dev/null
+  assert_ok   grep -q '^opt1|optional one' "$_lf" "enumerator lists opt1 with desc"
+  assert_ok   grep -q '^opt2|optional two' "$_lf" "enumerator lists opt2 with desc"
+  assert_fail grep -q '^req|' "$_lf" "enumerator excludes the non-optional row"
+
+  # 3) --install-optionals=opt1 installs only that one (csv subset)
+  assert_ok $TOOL install "$_m" --host macmini --install-optionals=opt1 "install with --install-optionals=opt1"
+  assert_file_exists "$MOCK_STATE/opt1"   "opt1 installed by name"
+  assert_ok test ! -f "$MOCK_STATE/opt2"  "opt2 still skipped (not in the csv)"
+
+  # 4) --install-optionals=all installs the remainder
+  assert_ok $TOOL install "$_m" --host macmini --install-optionals=all "install with --install-optionals=all"
+  assert_file_exists "$MOCK_STATE/opt2"   "opt2 installed under =all"
+
+  # 5) prune protection: an installed optional is STILL declared, so a plain
+  #    sync --prune (optionals not selected this run) must not remove it.
+  assert_ok $TOOL sync "$_m" --host macmini --prune --force "sync --prune with optionals unselected"
+  assert_file_exists "$MOCK_STATE/opt1"   "installed optional opt1 not pruned (still declared)"
+  assert_file_exists "$MOCK_STATE/opt2"   "installed optional opt2 not pruned (still declared)"
+  assert_ok grep -q '^opt2.manager=' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "opt2 still tracked after prune"
+
+  rm -f "$_m" "$_lf"
+}
+
 _test_runner

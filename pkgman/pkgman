@@ -112,6 +112,10 @@ _NO_TRACK=false
 _HOST=""
 _PRUNE=false
 _FORCE=false
+# Manifest optionals: "" = install no optional-tagged rows (default); "all" =
+# install every optional row in scope; a comma-list of names = install only
+# those. Optional rows are ALWAYS declared (never pruned) regardless of this.
+_INSTALL_OPTIONALS=""
 
 # Status constants
 readonly _PKGMAN_STATUS_INSTALLED="installed"
@@ -167,6 +171,14 @@ _main() {
         ;;
       --prune)
         _PRUNE=true
+        shift
+        ;;
+      --install-optionals)
+        _INSTALL_OPTIONALS="all"
+        shift
+        ;;
+      --install-optionals=*)
+        _INSTALL_OPTIONALS="${1#*=}"
         shift
         ;;
       --force)
@@ -250,6 +262,11 @@ _main() {
     version) _version; exit 0 ;;
     # Hidden test-only command: exposes _tags_match without needing to source pkgman
     __tags-match) _tags_match "$@"; exit $? ;;
+    # Hidden: list applicable optional rows (name|desc) for an interactive caller
+    __manifest-optionals)
+      [[ -f "${1:-}" ]] || { u.error "__manifest-optionals: manifest file required"; exit $_E_USG; }
+      [[ -n "$_HOST" ]] || { u.error "__manifest-optionals: --host required"; exit $_E_USG; }
+      _manifest_optional_names "$1" "$(loam.os)" "$_HOST"; exit $? ;;
     *) u.error "unknown command: $_command"; _help; exit $_E_USG ;;
   esac
 }
@@ -453,6 +470,24 @@ _tags_match() {  # $1=tags $2=os $3=host ; return 0 if row applies
   return 0
 }
 
+##@ True if a row's tags mark it optional. 'optional' is an ordinary token in
+##@ the tags column (e.g. 'mac,optional'); _tags_match ignores it (it is neither
+##@ an OS nor a host), so an optional row still filters correctly by os/host.
+##@ Usage: _row_is_optional "$_tags" && ...
+_row_is_optional() {  # $1=tags ; return 0 if optional
+  case ",${1// /}," in *,optional,*) return 0 ;; *) return 1 ;; esac
+}
+
+##@ True if an optional row named $1 should be installed given _INSTALL_OPTIONALS.
+##@ "" -> never; "all" -> always; else membership in the comma-list.
+_optional_approved() {  # $1=name ; return 0 if approved for install
+  case "$_INSTALL_OPTIONALS" in
+    "") return 1 ;;
+    all) return 0 ;;
+    *) case ",${_INSTALL_OPTIONALS// /}," in *,"$1",*) return 0 ;; *) return 1 ;; esac ;;
+  esac
+}
+
 ##@ Strip leading/trailing whitespace from a string, preserving internal whitespace
 ##@ Usage: _trimmed="$(_manifest_trim "$_raw")"
 _manifest_trim() {
@@ -475,7 +510,7 @@ _manifest_apply() {
   [[ "$_mode" == "install" ]] || { u.error "manifest: unsupported mode '$_mode'"; return $_E_USG; }
 
   local _name _handler _desc _params _tags
-  local _applied=0 _skipped_tags=0 _skipped_handler=0
+  local _applied=0 _skipped_tags=0 _skipped_handler=0 _skipped_optional=0
   while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
     _name="$(_manifest_trim "${_name:-}")"
     [[ -z "$_name" ]] && continue
@@ -488,6 +523,13 @@ _manifest_apply() {
 
     if ! _tags_match "$_tags" "$_os" "$_host" </dev/null; then
       _skipped_tags=$((_skipped_tags + 1))
+      continue
+    fi
+
+    # Optional rows are installed only when approved (--install-optionals);
+    # otherwise skipped for install BUT still declared (prune-safe) elsewhere.
+    if _row_is_optional "$_tags" && ! _optional_approved "$_name"; then
+      _skipped_optional=$((_skipped_optional + 1))
       continue
     fi
 
@@ -533,7 +575,7 @@ _manifest_apply() {
     _applied=$((_applied + 1))
   done < "$_file"
 
-  u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler)"
+  u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler), $_skipped_optional optional (not selected)"
   return 0
 }
 
@@ -559,6 +601,26 @@ _manifest_declared_names() {  # $1=file $2=os $3=host -> applicable names, one p
     _tags_match "$_tags" "$_os" "$_host" </dev/null || continue
 
     echo "$_name"
+  done < "$_file"
+  return 0
+}
+
+##@ List applicable OPTIONAL rows as 'name|desc', one per line (os/host filtered).
+##@ For an interactive caller (e.g. kickstart) to enumerate + prompt, then pass
+##@ the accepted names back via --install-optionals=<csv>. Read-only.
+##@ Usage: _manifest_optional_names <file> <os> <host>
+_manifest_optional_names() {  # $1=file $2=os $3=host -> "name|desc" per optional row
+  local _file="$1" _os="$2" _host="$3"
+  local _name _handler _desc _params _tags
+  while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
+    _name="$(_manifest_trim "${_name:-}")"
+    [[ -z "$_name" ]] && continue
+    case "$_name" in \#*) continue ;; esac
+    _desc="$(_manifest_trim "${_desc:-}")"
+    _tags="$(_manifest_trim "${_tags:-}")"
+    _tags_match "$_tags" "$_os" "$_host" </dev/null || continue
+    _row_is_optional "$_tags" || continue
+    printf '%s|%s\n' "$_name" "$_desc"
   done < "$_file"
   return 0
 }
@@ -2078,6 +2140,11 @@ GLOBAL OPTIONS:
     --host <h>          Target host tag for manifest mode (REQUIRED with install/sync <manifest>)
     --prune             With sync <manifest>: remove undeclared pkgman-managed core packages
                           (report-only without this flag)
+    --install-optionals[=all|<name,...>]
+                          With install/sync <manifest>: install rows tagged 'optional'.
+                          Bare or '=all' installs every optional in scope; '=name1,name2'
+                          installs only those. Default (omitted): optionals are skipped for
+                          install but still DECLARED, so an installed optional is never pruned.
     -h, --help          Show this help
     -v, --version       Show version
 
