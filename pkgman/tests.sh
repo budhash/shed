@@ -94,7 +94,41 @@ test_tags_matcher() {
   assert_ok   $TOOL __tags-match 'mac,macmini'    mac macmini "host tag matches"
   assert_fail $TOOL __tags-match 'mac,laptop'     mac macmini "wrong host rejected"
   assert_ok   $TOOL __tags-match 'laptop,macmini' mac macmini "multi-host includes ours"
+  # host vocabulary is NOT hardcoded (#7): any host token works, `optional` is never a host
+  assert_ok   $TOOL __tags-match 'mac,bytepod'   mac bytepod  "arbitrary host tag (bytepod) matches"
+  assert_fail $TOOL __tags-match 'mac,bytepod'   mac laptop   "arbitrary host tag rejects a different host"
+  assert_ok   $TOOL __tags-match 'server'        linux server "bare host tag matches on right host"
+  assert_ok   $TOOL __tags-match 'mac,optional'  mac bytepod  "optional is a keyword, not a host filter"
+  assert_fail $TOOL __tags-match 'linux,edge'    linux server "unknown host 'edge' still filters (≠ server)"
   assert_eq 0 "$(grep -cE '(^|[^A-Za-z_])hostname([^A-Za-z_-]|$)' ./pkgman)" "no hostname derivation in pkgman"
+}
+
+test_cask_source_default() {
+  _section_header "#9: cask defaults source to the package name (no explicit source= needed)"
+  setup_cfg
+  assert_ok $TOOL add cask raycast --detail "launcher" "add cask with no --source succeeds"
+  assert_ok grep -q '^raycast.source=raycast' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "cask source defaulted to the name"
+}
+
+test_manifest_bad_row_skips_and_signals() {
+  _section_header "#8: an unusable row is skipped (run continues) AND the run exits nonzero"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+  local _m; _m=$(mktemp "${TMPDIR:-/tmp}/badrow-manifest-XXXXXX")
+  # a github row missing required dest=/artifact= fails validation; a good script row follows it
+  printf 'ghbad | github | broken row | source=owner/repo | %s\ngood  | script | ok row | source=./mocks/mock-pkg!name=good | %s\n' "$THIS_OS" "$THIS_OS" > "$_m"
+  assert_fail $TOOL install "$_m" --host macmini "manifest with an unusable row exits nonzero (not u.die mid-run)"
+  assert_file_exists "$MOCK_STATE/good" "the good row AFTER the bad one still installed — the run was not aborted"
+  rm -f "$_m"
+}
+
+test_resolve_source_pkgman_dir() {
+  _section_header "#11: script source search includes pkgman's own dir (dogfood provision)"
+  # shellcheck disable=SC1091
+  source ./pkglib
+  local _p; _p=$(_pkglib.resolve_source_path pkgboot)
+  assert_contains "$_p" "/pkgboot" "resolves a script that lives beside pkgman itself"
+  assert_ok test -x "$_p" "resolved path is executable"
 }
 
 test_tags_metadata() {
