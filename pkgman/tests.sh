@@ -105,6 +105,8 @@ test_tags_matcher() {
 
 test_cask_source_default() {
   _section_header "#9: cask defaults source to the package name (no explicit source= needed)"
+  # cask is a macOS-only manager; `add cask` on linux correctly fails the OS-compat gate.
+  [[ "$(uname)" == "Darwin" ]] || return 0
   setup_cfg
   assert_ok $TOOL add cask raycast --detail "launcher" "add cask with no --source succeeds"
   assert_ok grep -q '^raycast.source=raycast' "$PKGMAN_CONFIG_DIR/index/package.core.cfg" "cask source defaulted to the name"
