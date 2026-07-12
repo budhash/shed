@@ -312,9 +312,12 @@ _pkglib.resolve_source_path() {
   
   # Search priority order for relative paths:
   local _search_paths=(
+    # 0. pkgman's own dir (dogfooding: a self-hosted provision runs script rows like `pkgboot`
+    #    that live beside pkgman itself — e.g. radix seeds shed then provisions from it)
+    "$(dirname "${BASH_SOURCE[0]}")/$_source"
     # 1. Relative to current script's bin directory (for pkglib in lib/, check ../bin/)
     "$(dirname "${BASH_SOURCE[0]}")/../bin/$_source"
-    # 2. Relative to current script's ins directory (for pkglib in lib/, check ../ins/)  
+    # 2. Relative to current script's ins directory (for pkglib in lib/, check ../ins/)
     "$(dirname "${BASH_SOURCE[0]}")/../ins/$_source"
     # 3. Standard locations
     "$HOME/.local/bin/$_source"

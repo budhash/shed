@@ -457,16 +457,30 @@ _validate_os_compatibility() {
 
 ##@ Check whether a package's tags allow it to apply on the given os/host
 ##@ Empty tags always match. Tags containing mac|linux require that os to match;
-##@ tags containing laptop|macmini|server require that host to match. Host is
-##@ ALWAYS passed in by the caller (--host) - never derived from the local machine.
+##@ OS tokens (mac|linux) filter by OS; RESERVED keywords (optional) are ignored here;
+##@ ANY OTHER token is treated as a HOST tag — so any host value works with no hardcoded
+##@ fleet list. If a row names any host token, --host must be among them. Host is ALWAYS
+##@ passed in by the caller (--host), never derived from the local machine.
 ##@ Usage: _tags_match "$_tags" "$_os" "$_host" || continue
 _tags_match() {  # $1=tags $2=os $3=host ; return 0 if row applies
   local _t=",${1// /}," _os="$2" _host="$3"
   [[ "$_t" == ",," ]] && return 0
+  # OS filter: if the row names any known OS, ours must be among them.
   case "$_t" in *,mac,*|*,linux,*)
     case "$_t" in *,"$_os",*) ;; *) return 1;; esac ;; esac
-  case "$_t" in *,laptop,*|*,macmini,*|*,server,*)
-    case "$_t" in *,"$_host",*) ;; *) return 1;; esac ;; esac
+  # Host filter: any non-OS, non-reserved token is a host tag. Collect them; if any
+  # exist, --host must match one. (No hardcoded host vocabulary — laptop/bytepod/server
+  # or any future host value all work; `optional` and OS tokens are never hosts.)
+  local _tok _has_host=0 _host_ok=0 _oldifs="$IFS"
+  IFS=','
+  for _tok in $_t; do
+    [[ -z "$_tok" ]] && continue
+    case "$_tok" in mac|linux|optional) continue ;; esac
+    _has_host=1
+    [[ "$_tok" == "$_host" ]] && _host_ok=1
+  done
+  IFS="$_oldifs"
+  [[ $_has_host -eq 1 && $_host_ok -eq 0 ]] && return 1
   return 0
 }
 
@@ -510,7 +524,7 @@ _manifest_apply() {
   [[ "$_mode" == "install" ]] || { u.error "manifest: unsupported mode '$_mode'"; return $_E_USG; }
 
   local _name _handler _desc _params _tags
-  local _applied=0 _skipped_tags=0 _skipped_handler=0 _skipped_optional=0
+  local _applied=0 _skipped_tags=0 _skipped_handler=0 _skipped_optional=0 _failed=0
   while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
     _name="$(_manifest_trim "${_name:-}")"
     [[ -z "$_name" ]] && continue
@@ -565,17 +579,21 @@ _manifest_apply() {
       _add_args+=("${_kwargs[@]+"${_kwargs[@]}"}")
       if ! _cmd_add "$_normalized_handler" "$_name" "${_add_args[@]+"${_add_args[@]}"}" </dev/null; then
         u.warn "manifest: add failed for $_name - skipping row"
+        _failed=$((_failed + 1))
         continue
       fi
     fi
 
     if [[ "$(_get_package_status "$_name" </dev/null)" != "$_PKGMAN_STATUS_INSTALLED" ]]; then
-      _cmd_install "$_name" </dev/null || u.warn "manifest: install failed for $_name"
+      if ! _cmd_install "$_name" </dev/null; then u.warn "manifest: install failed for $_name"; _failed=$((_failed + 1)); continue; fi
     fi
     _applied=$((_applied + 1))
   done < "$_file"
 
-  u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler), $_skipped_optional optional (not selected)"
+  u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler), $_skipped_optional optional (not selected), $_failed failed"
+  # Automation contract: exit nonzero if any ATTEMPTED row failed (add/install), while still
+  # having attempted every other row. Skips (unknown handler / tag-filtered / optional) don't count.
+  [[ $_failed -gt 0 ]] && return $_E
   return 0
 }
 
@@ -634,7 +652,11 @@ _manifest_optional_names() {  # $1=file $2=os $3=host -> "name|desc" per optiona
 ##@ Usage: _manifest_sync <file> <os> <host> <prune:true|false>
 _manifest_sync() {
   local _file="$1" _os="$2" _host="$3" _prune="${4:-false}"
-  _manifest_apply "$_file" "$_os" "$_host" install || return $?
+  # Capture apply's result but DON'T abort: a failed install row doesn't change what's DECLARED,
+  # so prune (which removes undeclared packages) is still safe and should run. Surface the failure
+  # at the end. `|| _apply_rc=$?` also keeps set -e from tripping on the nonzero apply.
+  local _apply_rc=0
+  _manifest_apply "$_file" "$_os" "$_host" install || _apply_rc=$?
 
   local _declared="$(_manifest_declared_names "$_file" "$_os" "$_host")"
 
@@ -651,25 +673,26 @@ _manifest_sync() {
     _undeclared+=("$_pkg")
   done
 
+  # Every exit folds in _apply_rc so an install failure surfaces even when prune converged cleanly.
   if [[ ${#_undeclared[@]} -eq 0 ]]; then
     u.info "✓ sync: converged (nothing undeclared)"
-    return 0
+    return $_apply_rc
   fi
 
   u.warn "undeclared pkgman-managed package(s): ${_undeclared[*]}"
 
   if [[ "$_prune" != "true" ]]; then
     u.info "run again with --prune to remove them"
-    return 0
+    return $_apply_rc
   fi
 
-  _dry "prune: ${_undeclared[*]}" && return 0
+  _dry "prune: ${_undeclared[*]}" && return $_apply_rc
 
   if [[ "$_FORCE" != "true" ]]; then
-    loam.confirm "prune ${#_undeclared[@]} undeclared package(s): ${_undeclared[*]}?" || { u.info "prune cancelled"; return 0; }
+    loam.confirm "prune ${#_undeclared[@]} undeclared package(s): ${_undeclared[*]}?" || { u.info "prune cancelled"; return $_apply_rc; }
   fi
 
-  local _result=0
+  local _result=$_apply_rc
   for _pkg in "${_undeclared[@]}"; do
     if _cmd_uninstall "$_pkg" </dev/null && _cmd_remove "$_pkg" --force </dev/null; then
       u.info "✓ pruned $_pkg"
@@ -1663,10 +1686,10 @@ _cmd_add_unified() {
   # For traditional managers, default source to package name
   if [[ "$_source" == "default" ]]; then
     case "$_manager" in
-      brew|apt|dnf|mas|cargo|go|pipx|npm)
+      brew|apt|dnf|mas|cargo|go|pipx|npm|cask)
         _source="$_package"
         ;;
-      # github/download/script require explicit --source
+      # github/download/dmg/script require an explicit --source (URL/repo/path)
     esac
   fi
   
@@ -1677,12 +1700,13 @@ _cmd_add_unified() {
   [[ "$_artifact" != "default" ]] && _validation_kwargs+=("--artifact=$_artifact")
   [[ "$_channel" != "default" ]] && _validation_kwargs+=("--channel=$_channel")
   
-  # Add any additional kwargs
+  # Add any additional kwargs. Skip metadata-only keys (tags) so they don't leak into
+  # pkglib.*.validate, which never asks for them (#12: --tags leak into validate kwargs).
   local _i=0
   while [[ $_i -lt ${#_kwargs_keys[@]} ]]; do
     local _key="${_kwargs_keys[$_i]:-}"
     local _value="${_kwargs_values[$_i]:-}"
-    if [[ -n "$_key" && -n "$_value" ]]; then
+    if [[ -n "$_key" && -n "$_value" && "$_key" != "tags" ]]; then
       _validation_kwargs+=("--$_key=$_value")
     fi
     _i=$((_i + 1))
@@ -1691,7 +1715,9 @@ _cmd_add_unified() {
   # Always pass source as first parameter - pkglib needs the actual package identifier
   # shellcheck disable=SC2145  # legacy archive pattern, pre-loam
   u.debug "pkglib.${_manager}.validate - source=$_source, force=false, validation_kwargs=${_validation_kwargs[@]:-}"
-  pkglib.${_manager}.validate "$_source" "false" "${_validation_kwargs[@]:-}" || u.die "validation failed for $_manager package '$_package' with source '$_source'"
+  # Return (do NOT u.die): in manifest mode the caller skips this row and keeps going;
+  # a direct `add` still sees the nonzero exit. One bad row must never abort a whole manifest.
+  pkglib.${_manager}.validate "$_source" "false" "${_validation_kwargs[@]:-}" || { u.error "validation failed for $_manager package '$_package' with source '$_source'"; return $_E_USG; }
 
   # Store unified metadata (core parameters only) - SET SCOPE FIRST
   _set_metadata "$_package" "scope" "$_scope"
