@@ -9,7 +9,7 @@
 # commands for day-to-day package management.
 # --------------------------------------------------------------------
 # AUTHOR: Budha <budhash@gmail.com>
-# VERSION: 1.0.0
+# VERSION: 1.1.0
 # LICENSE: MIT License
 # --------------------------------------------------------------------
 # __TEMPLATE__: https://github.com/budhash/zap-sh/blob/main/templates/basic.sh
@@ -97,8 +97,9 @@ readonly PKGMAN_STATUS_FILE="$PKGMAN_CONFIG_DIR/status.cfg"
 readonly PKGMAN_MANAGERS=(brew apt dnf github download mas script cargo go pipx npm cask dmg)
 readonly PKGMAN_OPERATIONS=(validate install update uninstall status)
 
-# Core metadata fields (excluded from kwargs extraction)
-readonly PKGMAN_CORE_METADATA=(manager source dest artifact channel scope os sudo detail tags)
+# Core metadata fields (excluded from kwargs extraction). `hold` is a pkgman-only marker consumed by
+# `upgrade` (a held/coupled row is skipped) — it must NEVER leak into a handler command, hence listed here.
+readonly PKGMAN_CORE_METADATA=(manager source dest artifact channel scope os sudo detail tags hold)
 
 # Scope constants
 readonly PKGMAN_SCOPE_CORE="core"
@@ -245,6 +246,17 @@ _main() {
         exit $?
       fi
       _cmd_sync "$@"
+      ;;
+    upgrade)
+      if [[ -f "${1:-}" ]]; then
+        # Manifest mode: version-upgrade every installed, tags-matching, non-held row via each
+        # handler's own update op. Completes the triad: install (add) -> upgrade (version) -> sync --prune.
+        [[ -n "$_HOST" ]] || { u.error "--host required for manifest mode (upgrade <manifest> --host <h>)"; exit $_E_USG; }
+        _manifest_upgrade "$1" "$(loam.os)" "$_HOST"
+        exit $?
+      fi
+      u.error "upgrade needs a manifest (upgrade <manifest> --host <h>); for one tracked package use: $__APP update <name>"
+      exit $_E_USG
       ;;
     # Batch operations
     install-all) _cmd_install_all "$@" ;;
@@ -593,6 +605,79 @@ _manifest_apply() {
   u.info "✓ manifest applied: $_applied row(s) processed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler), $_skipped_optional optional (not selected), $_failed failed"
   # Automation contract: exit nonzero if any ATTEMPTED row failed (add/install), while still
   # having attempted every other row. Skips (unknown handler / tag-filtered / optional) don't count.
+  [[ $_failed -gt 0 ]] && return $_E
+  return 0
+}
+
+##@ Version-upgrade every INSTALLED manifest row whose tags match os/host, via each handler's own
+##@ pkglib `update` operation (brew upgrade / mas upgrade / pipx upgrade / npm update -g / re-fetch for
+##@ github|download|dmg). Manifest-SCOPED: only declared rows are touched, never other installed software
+##@ (the same guarantee `sync --prune` gives). HOLD-AWARE: a row with a `hold=` param (any non-false
+##@ value) is a coupled/pinned tool whose upgrade could break a dependent - it is SKIPPED (upgrade it
+##@ deliberately). Rows that are not installed are skipped (that's an `install` job); unknown handlers are
+##@ skipped with a warning. Completes the triad install (add) -> upgrade (version) -> sync --prune.
+##@ Usage: _manifest_upgrade <file> <os> <host>
+_manifest_upgrade() {
+  local _file="$1" _os="$2" _host="$3"
+  [[ -f "$_file" ]] || { u.error "manifest not found: $_file"; return $_E_NF; }
+
+  local _name _handler _desc _params _tags
+  local _upgraded=0 _skipped_tags=0 _skipped_handler=0 _skipped_hold=0 _skipped_missing=0 _failed=0
+  while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
+    _name="$(_manifest_trim "${_name:-}")"
+    [[ -z "$_name" ]] && continue
+    case "$_name" in \#*) continue ;; esac
+
+    _handler="$(_manifest_trim "${_handler:-}")"
+    _params="$(_manifest_trim "${_params:-}")"
+    _tags="$(_manifest_trim "${_tags:-}")"
+
+    if ! _tags_match "$_tags" "$_os" "$_host" </dev/null; then
+      _skipped_tags=$((_skipped_tags + 1)); continue
+    fi
+
+    local _normalized_handler
+    _normalized_handler="$(_normalize_and_validate_manager "$_handler" 2>/dev/null </dev/null)" || {
+      u.warn "manifest: unknown handler '$_handler' for $_name - skipping row"
+      _skipped_handler=$((_skipped_handler + 1)); continue
+    }
+
+    # HOLD-AWARE: read the row's `hold` param FRESH from the manifest (not stored metadata), so a newly
+    # marked coupled row takes effect immediately. Any value except false/no/0 means held.
+    local _kv_arr=() _p _key _val _held=false _hold_reason=""
+    if [[ -n "$_params" ]]; then IFS='!;' read -r -a _kv_arr <<< "$_params" || true; fi
+    for _p in "${_kv_arr[@]+"${_kv_arr[@]}"}"; do
+      [[ -z "$_p" ]] && continue
+      _key="${_p%%=*}"; _val="${_p#*=}"; [[ "$_p" == "$_key" ]] && _val=""
+      if [[ "$_key" == "hold" ]]; then
+        case "$_val" in false|no|0) _held=false ;; *) _held=true; _hold_reason="$_val" ;; esac
+      fi
+    done
+    if $_held; then
+      u.info "held: $_name${_hold_reason:+ ($_hold_reason)} - upgrade deliberately (skipped)"
+      _skipped_hold=$((_skipped_hold + 1)); continue
+    fi
+
+    # Only upgrade what is actually installed; a missing row is an install job, not an upgrade.
+    if [[ "$(_get_package_status "$_name" </dev/null)" != "$_PKGMAN_STATUS_INSTALLED" ]]; then
+      _skipped_missing=$((_skipped_missing + 1)); continue
+    fi
+
+    local _result=0
+    if ! _dry "pkglib.$_normalized_handler.update $_name"; then
+      _call_pkglib "$_normalized_handler" "update" "$_name" </dev/null || _result=$?
+    fi
+    if [[ $_result -eq 0 ]]; then
+      _should_update_state && _set_status "$_name" "$_PKGMAN_FIELD_LAST_CHECKED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" </dev/null 2>/dev/null || true
+      _upgraded=$((_upgraded + 1))
+    else
+      u.warn "manifest: upgrade failed for $_name"
+      _failed=$((_failed + 1))
+    fi
+  done < "$_file"
+
+  u.info "✓ manifest upgrade: $_upgraded upgraded, $_skipped_hold held, $_skipped_missing not-installed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler), $_failed failed"
+  # Automation contract (mirrors _manifest_apply): nonzero iff an attempted upgrade failed.
   [[ $_failed -gt 0 ]] && return $_E
   return 0
 }
@@ -2146,6 +2231,9 @@ COMMANDS:
                                         Converge: apply the manifest, then report (or, with
                                         --prune, remove) tracked install_method=pkgman core
                                         packages no longer declared by it
+    upgrade <manifest> --host <h>       Version-upgrade every installed, tags-matching row via each
+                                        handler (brew/mas/pipx/npm/…); manifest-scoped + hold-aware
+                                        (a hold= param skips the row - upgrade it deliberately)
 
     # Batch Operations  
     install-all [--force]               Install all missing tracked packages (core scope only)

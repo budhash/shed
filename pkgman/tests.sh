@@ -387,4 +387,43 @@ test_manifest_optionals() {
   rm -f "$_m" "$_lf"
 }
 
+test_manifest_upgrade() {
+  _section_header "P1: manifest upgrade (per-handler update, manifest-scoped + hold-aware)"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+
+  # install manifest: a plain row + a HELD (coupled) row. hold= must NOT reach the handler (core metadata).
+  local _mi; _mi=$(mktemp "${TMPDIR:-/tmp}/upg-install-XXXXXX")
+  printf 'alpha | script | mock A    | source=%s/mocks/mock-pkg!name=alpha            | \n' "$PWD" >  "$_mi"
+  printf 'held1 | script | mock held | source=%s/mocks/mock-pkg!name=held1!hold=coupled | \n' "$PWD" >> "$_mi"
+  assert_ok $TOOL install "$_mi" --host macmini "seed install (alpha + held1)"
+  assert_file_exists "$MOCK_STATE/alpha" "alpha installed"
+  assert_file_exists "$MOCK_STATE/held1" "held1 installed (hold= did not break install — filtered from handler kwargs)"
+
+  # upgrade manifest = install rows + a declared-but-never-installed row (ghost)
+  local _mu; _mu=$(mktemp "${TMPDIR:-/tmp}/upg-XXXXXX")
+  cat "$_mi" > "$_mu"
+  printf 'ghost | script | mock ghost | source=%s/mocks/mock-pkg!name=ghost | \n' "$PWD" >> "$_mu"
+
+  local out; out=$($TOOL upgrade "$_mu" --host macmini 2>&1)
+  assert_ok $TOOL upgrade "$_mu" --host macmini "upgrade exits 0"
+  assert_contains "$out" "mock updated alpha" "installed row upgraded via the handler's update op"
+  assert_contains "$out" "held: held1" "held/coupled row surfaced"
+  assert_eq 0 "$(printf '%s\n' "$out" | grep -c 'mock updated held1' || true)" "held row was NOT upgraded (skipped, upgrade deliberately)"
+  assert_contains "$out" "1 upgraded" "summary counts the one real upgrade"
+  assert_contains "$out" "1 held" "summary counts the held row"
+  assert_contains "$out" "1 not-installed" "declared-but-missing ghost row skipped (that's an install job)"
+
+  # --dry-run plans, mutates nothing (the [DRY RUN] marker + no handler call)
+  local dout; dout=$($TOOL --dry-run upgrade "$_mu" --host macmini 2>&1)
+  assert_contains "$dout" "[DRY RUN] pkglib.script.update alpha" "dry-run plans the per-handler upgrade"
+  assert_eq 0 "$(printf '%s\n' "$dout" | grep -c 'mock updated alpha' || true)" "dry-run ran no real upgrade"
+
+  # guardrails: --host required for manifest mode; a bare (non-file) arg is rejected with guidance
+  assert_fail $TOOL upgrade "$_mu" "manifest upgrade without --host fails"
+  assert_fail $TOOL upgrade not-a-file --host macmini "bare-name upgrade fails (points to: update <name>)"
+
+  rm -f "$_mi" "$_mu"
+}
+
 _test_runner
