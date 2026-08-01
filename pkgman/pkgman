@@ -117,6 +117,10 @@ _FORCE=false
 # install every optional row in scope; a comma-list of names = install only
 # those. Optional rows are ALWAYS declared (never pruned) regardless of this.
 _INSTALL_OPTIONALS=""
+# Manifest upgrade scope: "" = every applicable row (default); a comma-list of names = ONLY those rows.
+# Targeted upgrades are the CVE-response shape ("patch just openssl now"), and an explicitly named row
+# OVERRIDES its hold (naming it IS the deliberate act a hold asks for).
+_ONLY=""
 
 # Status constants
 readonly _PKGMAN_STATUS_INSTALLED="installed"
@@ -180,6 +184,15 @@ _main() {
         ;;
       --install-optionals=*)
         _INSTALL_OPTIONALS="${1#*=}"
+        shift
+        ;;
+      --only)
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--only requires a comma-separated name list"; exit $_E_USG; }
+        _ONLY="$2"
+        shift 2
+        ;;
+      --only=*)
+        _ONLY="${1#*=}"
         shift
         ;;
       --force)
@@ -506,6 +519,21 @@ _row_is_optional() {  # $1=tags ; return 0 if optional
 
 ##@ True if an optional row named $1 should be installed given _INSTALL_OPTIONALS.
 ##@ "" -> never; "all" -> always; else membership in the comma-list.
+##@ Is this row in the --only scope? Returns 0 when --only is unset (no scoping) or the name is listed.
+##@ Usage: _only_selected <name>
+_only_selected() {  # $1=name ; return 0 if in scope
+  [[ -z "$_ONLY" ]] && return 0
+  case ",${_ONLY// /}," in *,"$1",*) return 0 ;; *) return 1 ;; esac
+}
+
+##@ Was this row named EXPLICITLY on --only? (a named row overrides its hold - naming it is the
+##@ deliberate act the hold asks for; an unscoped run never overrides).
+##@ Usage: _only_named <name>
+_only_named() {  # $1=name ; return 0 if explicitly listed
+  [[ -z "$_ONLY" ]] && return 1
+  case ",${_ONLY// /}," in *,"$1",*) return 0 ;; *) return 1 ;; esac
+}
+
 _optional_approved() {  # $1=name ; return 0 if approved for install
   case "$_INSTALL_OPTIONALS" in
     "") return 1 ;;
@@ -622,7 +650,7 @@ _manifest_upgrade() {
   [[ -f "$_file" ]] || { u.error "manifest not found: $_file"; return $_E_NF; }
 
   local _name _handler _desc _params _tags
-  local _upgraded=0 _skipped_tags=0 _skipped_handler=0 _skipped_hold=0 _skipped_missing=0 _failed=0
+  local _upgraded=0 _skipped_tags=0 _skipped_handler=0 _skipped_hold=0 _skipped_missing=0 _skipped_scope=0 _failed=0
   while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
     _name="$(_manifest_trim "${_name:-}")"
     [[ -z "$_name" ]] && continue
@@ -631,6 +659,11 @@ _manifest_upgrade() {
     _handler="$(_manifest_trim "${_handler:-}")"
     _params="$(_manifest_trim "${_params:-}")"
     _tags="$(_manifest_trim "${_tags:-}")"
+
+    # --only scoping first: a targeted run (CVE response) touches nothing else.
+    if ! _only_selected "$_name"; then
+      _skipped_scope=$((_skipped_scope + 1)); continue
+    fi
 
     if ! _tags_match "$_tags" "$_os" "$_host" </dev/null; then
       _skipped_tags=$((_skipped_tags + 1)); continue
@@ -653,9 +686,15 @@ _manifest_upgrade() {
         case "$_val" in false|no|0) _held=false ;; *) _held=true; _hold_reason="$_val" ;; esac
       fi
     done
+    # A hold is skipped by default, but naming the row on --only IS the deliberate act it asks for,
+    # so an explicit mention overrides it (that's how you patch a held tool for a CVE).
     if $_held; then
-      u.info "held: $_name${_hold_reason:+ ($_hold_reason)} - upgrade deliberately (skipped)"
-      _skipped_hold=$((_skipped_hold + 1)); continue
+      if _only_named "$_name"; then
+        u.info "held: $_name${_hold_reason:+ ($_hold_reason)} - explicitly named on --only, upgrading anyway"
+      else
+        u.info "held: $_name${_hold_reason:+ ($_hold_reason)} - upgrade deliberately (skipped)"
+        _skipped_hold=$((_skipped_hold + 1)); continue
+      fi
     fi
 
     # Only upgrade what is actually installed; a missing row is an install job, not an upgrade.
@@ -676,7 +715,12 @@ _manifest_upgrade() {
     fi
   done < "$_file"
 
-  u.info "✓ manifest upgrade: $_upgraded upgraded, $_skipped_hold held, $_skipped_missing not-installed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler), $_failed failed"
+  u.info "✓ manifest upgrade: $_upgraded upgraded, $_skipped_hold held, $_skipped_missing not-installed, $_skipped_tags filtered by tags, $_skipped_handler skipped (unknown handler)${_ONLY:+, $_skipped_scope out of --only scope}, $_failed failed"
+  # A targeted run that matched nothing is almost always a typo'd name - say so loudly rather than
+  # exiting 0 with a silent no-op ("I patched it" when nothing was touched is the dangerous failure).
+  if [[ -n "$_ONLY" && $_upgraded -eq 0 && $_failed -eq 0 ]]; then
+    u.warn "--only=$_ONLY matched no upgradable row (check the name, and that it is declared + installed)"
+  fi
   # Automation contract (mirrors _manifest_apply): nonzero iff an attempted upgrade failed.
   [[ $_failed -gt 0 ]] && return $_E
   return 0
@@ -2231,9 +2275,12 @@ COMMANDS:
                                         Converge: apply the manifest, then report (or, with
                                         --prune, remove) tracked install_method=pkgman core
                                         packages no longer declared by it
-    upgrade <manifest> --host <h>       Version-upgrade every installed, tags-matching row via each
+    upgrade <manifest> --host <h> [--only=<csv>]
+                                        Version-upgrade every installed, tags-matching row via each
                                         handler (brew/mas/pipx/npm/…); manifest-scoped + hold-aware
-                                        (a hold= param skips the row - upgrade it deliberately)
+                                        (a hold= param skips the row - upgrade it deliberately).
+                                        --only=<csv> upgrades just those rows (targeted CVE response);
+                                        naming a held row there overrides its hold
 
     # Batch Operations  
     install-all [--force]               Install all missing tracked packages (core scope only)
@@ -2254,6 +2301,8 @@ GLOBAL OPTIONS:
     --host <h>          Target host tag for manifest mode (REQUIRED with install/sync <manifest>)
     --prune             With sync <manifest>: remove undeclared pkgman-managed core packages
                           (report-only without this flag)
+    --only=<name,...>   With upgrade <manifest>: upgrade ONLY these declared rows (targeted CVE
+                          response). Naming a held row overrides its hold.
     --install-optionals[=all|<name,...>]
                           With install/sync <manifest>: install rows tagged 'optional'.
                           Bare or '=all' installs every optional in scope; '=name1,name2'
