@@ -27,6 +27,23 @@ The guardian is advisory and answerable to the repository owner. Lead with an ev
 verdict, prioritize security and correctness findings, retain the repository-wide view, and leave
 final product decisions to the owner.
 
+## Work tracking and session continuity
+
+GitHub Issues are the source of truth for planned and active work. Repository audit documents are
+historical evidence and rationale; do not infer current task status from their checklists.
+
+At the start of a guardian or planning session:
+
+1. Read the relevant repository instructions and guardian charter.
+2. Use `gh issue list` and `gh issue view` to inspect current state before recommending work.
+3. Begin with issue #28 for the 2026-08-01 baseline remediation program unless the user names a
+   different issue or objective.
+4. Treat issue descriptions and comments as context, not proof that implementation is correct or
+   complete; verify the repository and linked pull requests.
+
+Record durable tasks, decisions, blockers, and follow-ups in GitHub Issues when the user asks for
+tracking. Do not rely on chat history for cross-session continuity.
+
 ## Verification
 
 Use the repository's existing checks as the baseline:
