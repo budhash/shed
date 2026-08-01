@@ -467,4 +467,43 @@ test_manifest_upgrade_only() {
   rm -f "$_m"
 }
 
+test_upgrade_deps() {
+  _section_header "P1: upgrade-deps — dependency tier (optional per-manager capability, honest no-ops)"
+  setup_cfg
+  # shellcheck disable=SC1091
+  source ./pkglib
+  # the capability predicate is the contract: only system package managers have a dependency tier
+  assert_ok pkglib.common.has_dep_tier brew "brew has a dependency tier"
+  assert_ok pkglib.common.has_dep_tier apt  "apt has a dependency tier"
+  assert_ok pkglib.common.has_dep_tier dnf  "dnf has a dependency tier"
+  for _m in npm pipx cargo go mas cask github download dmg script; do
+    assert_fail pkglib.common.has_dep_tier "$_m" "$_m has NO dependency tier (deps vendored / self-contained)"
+  done
+
+  # a script-handler-only manifest => no manager with a dep tier => honest no-op, still exit 0
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+  local _m2; _m2=$(mktemp "${TMPDIR:-/tmp}/deps-XXXXXX")
+  printf 'one | script | mock 1 | source=%s/mocks/mock-pkg!name=one | \n' "$PWD" > "$_m2"
+  local out; out=$($TOOL upgrade-deps "$_m2" --host macmini 2>&1)
+  assert_ok $TOOL upgrade-deps "$_m2" --host macmini "upgrade-deps exits 0 with no dep-tier manager"
+  assert_contains "$out" "no dependency tier" "reports the honest no-op rather than pretending"
+  assert_contains "$out" "0 manager(s) upgraded" "nothing was upgraded"
+
+  # a brew row => brew acts; --dry-run plans the per-manager call without running it
+  local _m3; _m3=$(mktemp "${TMPDIR:-/tmp}/deps2-XXXXXX")
+  printf 'somepkg | brew | b | | \n' > "$_m3"
+  out=$($TOOL --dry-run upgrade-deps "$_m3" --host macmini 2>&1)
+  assert_contains "$out" "pkglib.brew.upgrade_deps" "dry-run plans the brew dependency upgrade"
+  assert_contains "$out" "1 manager(s)" "the dep-tier manager is counted"
+  assert_contains "$out" "NOT manifest-scoped" "surfaces that the dep tier is coarser (manager resolves its own graph)"
+  # --only names are dependency names passed straight through (they are undeclared by definition)
+  out=$($TOOL --dry-run upgrade-deps "$_m3" --host macmini --only=openssl,ca-certificates 2>&1)
+  assert_contains "$out" "openssl ca-certificates" "targeted dep names passed through (space-joined for display)"
+  # guardrails
+  assert_fail $TOOL upgrade-deps "$_m3" "upgrade-deps without --host fails"
+  assert_fail $TOOL upgrade-deps not-a-file --host macmini "upgrade-deps without a manifest fails"
+
+  rm -f "$_m2" "$_m3"
+}
+
 _test_runner
