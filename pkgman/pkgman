@@ -271,6 +271,16 @@ _main() {
       u.error "upgrade needs a manifest (upgrade <manifest> --host <h>); for one tracked package use: $__APP update <name>"
       exit $_E_USG
       ;;
+    upgrade-deps)
+      if [[ -f "${1:-}" ]]; then
+        # Dependency tier: software a manager pulled in transitively, which a manifest never declares.
+        [[ -n "$_HOST" ]] || { u.error "--host required for manifest mode (upgrade-deps <manifest> --host <h>)"; exit $_E_USG; }
+        _manifest_upgrade_deps "$1" "$(loam.os)" "$_HOST"
+        exit $?
+      fi
+      u.error "upgrade-deps needs a manifest (upgrade-deps <manifest> --host <h> [--only=<csv>])"
+      exit $_E_USG
+      ;;
     # Batch operations
     install-all) _cmd_install_all "$@" ;;
     sync-all) _cmd_sync_all "$@" ;;
@@ -722,6 +732,76 @@ _manifest_upgrade() {
     u.warn "--only=$_ONLY matched no upgradable row (check the name, and that it is declared + installed)"
   fi
   # Automation contract (mirrors _manifest_apply): nonzero iff an attempted upgrade failed.
+  [[ $_failed -gt 0 ]] && return $_E
+  return 0
+}
+
+##@ Upgrade the DEPENDENCY TIER: software a manager installed transitively (as a dependency of something
+##@ declared) and that the manifest therefore never names - a manifest declares top-level INTENT, not the
+##@ resolved graph. This is the companion to `upgrade`, which is manifest-scoped and so structurally
+##@ cannot reach these. Which managers are in play is derived FROM the manifest (the handlers its
+##@ applicable rows use), so this stays declaration-driven rather than hardcoding a package manager.
+##@ Only managers with a real dependency tier act (pkglib.common.has_dep_tier: brew/apt/dnf); the rest
+##@ report an honest no-op instead of pretending. With --only=<csv>, upgrades just those dependency
+##@ names. CAVEAT surfaced to the caller: a system package manager resolves its own graph, so this is
+##@ inherently coarser than a declared-row upgrade - it may pull related packages along.
+##@ Usage: _manifest_upgrade_deps <file> <os> <host>
+_manifest_upgrade_deps() {
+  local _file="$1" _os="$2" _host="$3"
+  [[ -f "$_file" ]] || { u.error "manifest not found: $_file"; return $_E_NF; }
+
+  # Which managers does this manifest actually use on this host? (dedup, order-preserving; bash 3.2:
+  # a space-padded string membership test, no associative arrays.)
+  # NB: collected into an ARRAY, not a space-joined string - this script runs with the secure
+  # IFS=$'\n\t' (line 21), under which `for m in $space_joined` would not word-split at all.
+  local _name _handler _desc _params _tags _norm _seen=" " _mgr_arr=()
+  while IFS='|' read -r _name _handler _desc _params _tags || [[ -n "$_name" ]]; do
+    _name="$(_manifest_trim "${_name:-}")"
+    [[ -z "$_name" ]] && continue
+    case "$_name" in \#*) continue ;; esac
+    _handler="$(_manifest_trim "${_handler:-}")"
+    _tags="$(_manifest_trim "${_tags:-}")"
+    _tags_match "$_tags" "$_os" "$_host" </dev/null || continue
+    _norm="$(_normalize_and_validate_manager "$_handler" 2>/dev/null </dev/null)" || continue
+    case "$_seen" in *" $_norm "*) continue ;; esac
+    _seen="$_seen$_norm "
+    _mgr_arr+=("$_norm")
+  done < "$_file"
+  [[ ${#_mgr_arr[@]} -eq 0 ]] && { u.info "no applicable manifest rows - nothing to do"; return 0; }
+
+  # --only names are dependency package names here (NOT manifest rows), so they are passed straight to
+  # the manager. A dependency is by definition undeclared, so there is nothing to validate them against.
+  local _only_args=() _o
+  if [[ -n "$_ONLY" ]]; then
+    local _oldifs="$IFS"; IFS=','
+    # shellcheck disable=SC2086  # deliberate word splitting of the csv
+    set -- ${_ONLY// /}
+    IFS="$_oldifs"
+    for _o in "$@"; do [[ -n "$_o" ]] && _only_args+=("$_o"); done
+  fi
+
+  local _acted=0 _noop=0 _failed=0 _m
+  for _m in "${_mgr_arr[@]}"; do
+    if ! pkglib.common.has_dep_tier "$_m"; then
+      u.debug "no dependency tier for $_m (deps are vendored or artifacts are self-contained) - skipping"
+      _noop=$((_noop + 1)); continue
+    fi
+    # Join for DISPLAY with an explicit space: under the secure IFS=$'\n\t', "${arr[*]}" would join
+    # with a newline and the message would read as several broken lines.
+    local _what="all outdated dependencies" _join="" _a
+    for _a in "${_only_args[@]+"${_only_args[@]}"}"; do _join="${_join:+$_join }$_a"; done
+    [[ -n "$_join" ]] && _what="$_join"
+    if ! _dry "pkglib.$_m.upgrade_deps ${_join:-<all>}"; then
+      u.info "upgrading $_m dependency tier: $_what"
+      if "pkglib.$_m.upgrade_deps" "${_only_args[@]+"${_only_args[@]}"}"; then _acted=$((_acted + 1))
+      else u.warn "dependency upgrade failed for $_m"; _failed=$((_failed + 1)); fi
+    else
+      _acted=$((_acted + 1))
+    fi
+  done
+
+  u.info "✓ dependency tier: $_acted manager(s) upgraded, $_noop with no dependency tier, $_failed failed"
+  [[ $_acted -gt 0 ]] && u.warn "the dependency tier is NOT manifest-scoped: a package manager resolves its own graph, so related packages may have been upgraded too"
   [[ $_failed -gt 0 ]] && return $_E
   return 0
 }
@@ -2281,6 +2361,11 @@ COMMANDS:
                                         (a hold= param skips the row - upgrade it deliberately).
                                         --only=<csv> upgrades just those rows (targeted CVE response);
                                         naming a held row there overrides its hold
+    upgrade-deps <manifest> --host <h> [--only=<csv>]
+                                        Upgrade the DEPENDENCY tier: software pulled in transitively by
+                                        the manifest's managers, which a manifest never declares. Only
+                                        managers with a real dependency tier act (brew/apt/dnf); others
+                                        no-op. NOT manifest-scoped - the manager resolves its own graph.
 
     # Batch Operations  
     install-all [--force]               Install all missing tracked packages (core scope only)

@@ -408,6 +408,20 @@ pkglib.common.update() {
   return 0
 }
 
+##@ Does this manager have a separate DEPENDENCY TIER - transitive packages it installs alongside what
+##@ you asked for, which can go outdated and be upgraded INDEPENDENTLY? True only for the system package
+##@ managers. The language managers (npm/pipx/cargo/go) vendor deps INSIDE the package, so upgrading the
+##@ package already covers them; mas/cask/github/download/dmg/script install self-contained artifacts
+##@ with no dependency tier at all. This is why upgrade-deps is an OPTIONAL capability rather than a 6th
+##@ required operation: forcing all 13 handlers to implement it would be false symmetry.
+##: pkglib.common.has_dep_tier <manager> -> if pkglib.common.has_dep_tier brew; then ...
+pkglib.common.has_dep_tier() {
+  case "${1:-}" in
+    brew|apt|dnf) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 ##@ common uninstall flow
 ##: pkglib.common.uninstall <manager> <name> <force> [--key=value...] -> pkglib.common.uninstall brew docker false --cask
 pkglib.common.uninstall() {
@@ -515,6 +529,24 @@ pkglib.brew.update() {
 ##: pkglib.brew.uninstall <name> <force> [--key=value...] -> pkglib.brew.uninstall docker false --cask
 pkglib.brew.uninstall() {
   pkglib.common.uninstall "brew" "$@"
+}
+
+##@ brew dependency-tier upgrade (OPTIONAL capability - see pkglib.common.has_dep_tier).
+##@ Upgrades software this manager installed as transitive DEPENDENCIES, which a manifest never
+##@ declares (only top-level intent is declared). With names, upgrades just those; bare, sweeps all
+##@ outdated formulae. NOTE: brew resolves its own graph, so this is inherently coarser than a
+##@ declared-row upgrade - it may pull related packages along. Caller surfaces that.
+##: pkglib.brew.upgrade_deps [name...] -> pkglib.brew.upgrade_deps openssl ca-certificates
+pkglib.brew.upgrade_deps() {
+  _pkglib.require_tool "brew" || return $_E_DEP
+  if [[ $# -gt 0 ]]; then
+    _debug "brew upgrade $*"
+    brew upgrade "$@" || { _error "brew upgrade failed: $*"; return $_E; }
+  else
+    _debug "brew upgrade (all outdated, incl. dependencies)"
+    brew upgrade || { _error "brew upgrade failed"; return $_E; }
+  fi
+  return 0
 }
 ##] brew
 
@@ -704,6 +736,20 @@ pkglib.apt.status() {
   dpkg -l "$_name" &>/dev/null && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
   return 0
 }
+
+##@ apt dependency-tier upgrade (OPTIONAL capability - see pkglib.common.has_dep_tier)
+##: pkglib.apt.upgrade_deps [name...] -> pkglib.apt.upgrade_deps libssl3
+pkglib.apt.upgrade_deps() {
+  _pkglib.require_tool "apt-get" || return $_E_DEP
+  if [[ $# -gt 0 ]]; then
+    _debug "apt-get install --only-upgrade -y $*"
+    apt-get install --only-upgrade -y "$@" || { _error "apt-get upgrade failed: $*"; return $_E; }
+  else
+    _debug "apt-get upgrade -y (all outdated, incl. dependencies)"
+    apt-get upgrade -y || { _error "apt-get upgrade failed"; return $_E; }
+  fi
+  return 0
+}
 ##] apt
 
 ##[ dnf
@@ -801,6 +847,20 @@ pkglib.dnf.status() {
   # Action - status checking doesn't need kwargs
   _debug "dnf list installed $_name"
   dnf list installed "$_name" &>/dev/null && echo "$_PKGLIB_STATUS_INSTALLED" || echo "$_PKGLIB_STATUS_MISSING"
+  return 0
+}
+
+##@ dnf dependency-tier upgrade (OPTIONAL capability - see pkglib.common.has_dep_tier)
+##: pkglib.dnf.upgrade_deps [name...] -> pkglib.dnf.upgrade_deps openssl-libs
+pkglib.dnf.upgrade_deps() {
+  _pkglib.require_tool "dnf" || return $_E_DEP
+  if [[ $# -gt 0 ]]; then
+    _debug "dnf upgrade -y $*"
+    dnf upgrade -y "$@" || { _error "dnf upgrade failed: $*"; return $_E; }
+  else
+    _debug "dnf upgrade -y (all outdated, incl. dependencies)"
+    dnf upgrade -y || { _error "dnf upgrade failed"; return $_E; }
+  fi
   return 0
 }
 ##] dnf
