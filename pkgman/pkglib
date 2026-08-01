@@ -408,6 +408,97 @@ pkglib.common.update() {
   return 0
 }
 
+##@ Can this manager ENUMERATE what it has installed, so `adopt` can reverse-sync it into a manifest?
+##@ Optional capability, like has_dep_tier - not every handler can answer "what did you install?"
+##@ (github/download/dmg/script place arbitrary artifacts; pkgman's own tracking is their only record).
+##: pkglib.common.can_list_installed <manager> -> if pkglib.common.can_list_installed brew; then ...
+pkglib.common.can_list_installed() {
+  case "${1:-}" in
+    brew|cask|mas|pipx|npm|apt|dnf) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+##@ List TOP-LEVEL installed packages, one per line, as: name<TAB>source<TAB>desc (source/desc may be
+##@ empty). TOP-LEVEL is the point: a manifest declares INTENT, so `adopt` must offer only what was
+##@ deliberately installed, never the transitive dependency closure (on a real box that is 275 formulae
+##@ vs 71 leaves). Dependencies belong to the upgrade-deps tier, not to the manifest.
+##: pkglib.brew.list_installed -> jq
+pkglib.brew.list_installed() {
+  _pkglib.require_tool "brew" || return $_E_DEP
+  # `leaves` = installed formulae nothing else depends on = what the user actually asked for
+  brew leaves 2>/dev/null | while IFS= read -r _n; do [[ -n "$_n" ]] && printf '%s\t\t\n' "$_n"; done
+  return 0
+}
+
+##: pkglib.cask.list_installed -> raycast<TAB>raycast
+pkglib.cask.list_installed() {
+  _pkglib.require_tool "brew" || return $_E_DEP
+  # casks are always top-level (nothing depends on a cask); source= is the cask token itself
+  brew list --cask 2>/dev/null | while IFS= read -r _n; do [[ -n "$_n" ]] && printf '%s\t%s\t\n' "$_n" "$_n"; done
+  return 0
+}
+
+##: pkglib.mas.list_installed -> keynote<TAB>409183694<TAB>Keynote
+pkglib.mas.list_installed() {
+  _pkglib.require_tool "mas" || return $_E_DEP
+  # `mas list` prints "<id>  <App Name>  (<version>)"; the name may contain spaces, so strip the
+  # trailing "(version)" and take everything after the id. Row name = a slug of the app name.
+  mas list 2>/dev/null | while IFS= read -r _line; do
+    [[ -z "$_line" ]] && continue
+    local _id _rest _nm _slug
+    _id="$(printf '%s' "$_line" | awk '{print $1}')"
+    [[ -z "$_id" ]] && continue
+    _rest="${_line#*"$_id"}"
+    _nm="$(printf '%s' "$_rest" | sed -e 's/[[:space:]]*([^()]*)[[:space:]]*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    _slug="$(printf '%s' "$_nm" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+    [[ -n "$_slug" ]] && printf '%s\t%s\t%s\n' "$_slug" "$_id" "$_nm"
+  done
+  return 0
+}
+
+##: pkglib.pipx.list_installed -> fastapi-clean-cli
+pkglib.pipx.list_installed() {
+  _pkglib.require_tool "pipx" || return $_E_DEP
+  # `pipx list --short` prints "<pkg> <version>"; every pipx app is top-level by construction
+  pipx list --short 2>/dev/null | while IFS= read -r _line; do
+    local _n; _n="$(printf '%s' "$_line" | awk '{print $1}')"
+    [[ -n "$_n" ]] && printf '%s\t\t\n' "$_n"
+  done
+  return 0
+}
+
+##: pkglib.npm.list_installed -> typescript
+pkglib.npm.list_installed() {
+  _pkglib.require_tool "npm" || return $_E_DEP
+  # `npm ls -g --depth=0` prints a tree; take each "pkg@version" leaf and strip the LAST @ (scoped
+  # names like @openai/codex legitimately start with one). npm itself is excluded - it is the manager.
+  npm ls -g --depth=0 2>/dev/null | sed -n 's/^[^a-zA-Z@]*\([@a-zA-Z].*\)$/\1/p' | while IFS= read -r _spec; do
+    [[ -z "$_spec" ]] && continue
+    # Every real entry is "pkg@version"; the tree's first line is the lib ROOT PATH (no '@') - drop it.
+    case "$_spec" in *@*) ;; *) continue ;; esac
+    local _n="${_spec%@*}"
+    [[ -z "$_n" || "$_n" == "npm" ]] && continue
+    printf '%s\t\t\n' "$_n"
+  done
+  return 0
+}
+
+##: pkglib.apt.list_installed -> nginx
+pkglib.apt.list_installed() {
+  _pkglib.require_tool "apt-mark" || return $_E_DEP
+  # showmanual = explicitly installed, excluding anything pulled in as a dependency
+  apt-mark showmanual 2>/dev/null | while IFS= read -r _n; do [[ -n "$_n" ]] && printf '%s\t\t\n' "$_n"; done
+  return 0
+}
+
+##: pkglib.dnf.list_installed -> nginx
+pkglib.dnf.list_installed() {
+  _pkglib.require_tool "dnf" || return $_E_DEP
+  dnf repoquery --userinstalled --qf '%{name}\n' 2>/dev/null | while IFS= read -r _n; do [[ -n "$_n" ]] && printf '%s\t\t\n' "$_n"; done
+  return 0
+}
+
 ##@ Does this manager have a separate DEPENDENCY TIER - transitive packages it installs alongside what
 ##@ you asked for, which can go outdated and be upgraded INDEPENDENTLY? True only for the system package
 ##@ managers. The language managers (npm/pipx/cargo/go) vendor deps INSIDE the package, so upgrading the

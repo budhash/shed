@@ -121,6 +121,9 @@ _INSTALL_OPTIONALS=""
 # Targeted upgrades are the CVE-response shape ("patch just openssl now"), and an explicitly named row
 # OVERRIDES its hold (naming it IS the deliberate act a hold asks for).
 _ONLY=""
+# adopt scope: --all offers every undeclared top-level package; --tags stamps the emitted rows.
+_ALL=false
+_TAGS=""
 
 # Status constants
 readonly _PKGMAN_STATUS_INSTALLED="installed"
@@ -193,6 +196,23 @@ _main() {
         ;;
       --only=*)
         _ONLY="${1#*=}"
+        shift
+        ;;
+      --all)
+        _ALL=true
+        shift
+        ;;
+      --tags)
+        # Global MIRROR of the per-command --tags (consumed by `adopt` to stamp emitted rows). Left in
+        # _args too so `add --tags <v>` keeps seeing it - same additive pattern as --force below.
+        [[ -n "${2:-}" && "$2" != "--"* ]] || { u.error "--tags requires a value"; exit $_E_USG; }
+        _TAGS="$2"
+        _args+=("$1" "$2")
+        shift 2
+        ;;
+      --tags=*)
+        _TAGS="${1#*=}"
+        _args+=("$1")
         shift
         ;;
       --force)
@@ -279,6 +299,19 @@ _main() {
         exit $?
       fi
       u.error "upgrade-deps needs a manifest (upgrade-deps <manifest> --host <h> [--only=<csv>])"
+      exit $_E_USG
+      ;;
+    adopt)
+      # REVERSE-SYNC (no --host: host-agnostic by design - see _manifest_adopt)
+      if [[ -f "${1:-}" ]]; then
+        local _adopt_manifest="$1" _adopt_names=""; shift
+        # --tags is re-added to _args (so `add` still sees it), so a flag can appear where the optional
+        # name/csv would be - take the next arg as names ONLY when it is not a flag.
+        case "${1:-}" in --*|"") ;; *) _adopt_names="$1" ;; esac
+        _manifest_adopt "$_adopt_manifest" "$_adopt_names" "$_ALL" "$_TAGS"
+        exit $?
+      fi
+      u.error "adopt needs a manifest (adopt <manifest> [<name>|<csv>] [--all] [--tags=<csv>])"
       exit $_E_USG
       ;;
     # Batch operations
@@ -803,6 +836,63 @@ _manifest_upgrade_deps() {
   u.info "✓ dependency tier: $_acted manager(s) upgraded, $_noop with no dependency tier, $_failed failed"
   [[ $_acted -gt 0 ]] && u.warn "the dependency tier is NOT manifest-scoped: a package manager resolves its own graph, so related packages may have been upgraded too"
   [[ $_failed -gt 0 ]] && return $_E
+  return 0
+}
+
+##@ REVERSE-SYNC: emit manifest rows for installed packages the manifest does NOT declare. The inverse
+##@ of `sync --prune`: same discovery ("installed but undeclared"), opposite resolution - prune EVICTS
+##@ the stray, adopt DECLARES it. Prints rows to STDOUT and never writes the manifest (pkgman does not
+##@ own a file it merely ingests; a caller that owns it appends and diffs). Only TOP-LEVEL packages are
+##@ offered (pkglib.<mgr>.list_installed) - a manifest declares INTENT, so the transitive dependency
+##@ closure must never be adopted into it.
+##@ Deliberately host-AGNOSTIC: dedupe is against EVERY declared row regardless of tags (a row declared
+##@ for another machine is still declared, and re-emitting it would duplicate), and the new rows' tags
+##@ come from --tags. So --host would be meaningless here, unlike install/sync/upgrade which must decide
+##@ which declared rows apply to THIS machine.
+##@ Usage: _manifest_adopt <file> <names-csv|""> <all:true|false> <tags>
+_manifest_adopt() {
+  local _file="$1" _names="${2:-}" _all="${3:-false}" _tags="${4:-}"
+  [[ -f "$_file" ]] || { u.error "manifest not found: $_file"; return $_E_NF; }
+  [[ "$_all" == "true" || -n "$_names" ]] || { u.error "adopt: name a package (or a csv), or pass --all"; return $_E_USG; }
+
+  # 1. every declared name, tags ignored (see above)
+  local _dn _dh _dd _dp _dt _declared=" "
+  while IFS='|' read -r _dn _dh _dd _dp _dt || [[ -n "$_dn" ]]; do
+    _dn="$(_manifest_trim "${_dn:-}")"
+    [[ -z "$_dn" ]] && continue
+    case "$_dn" in \#*) continue ;; esac
+    _declared="$_declared$_dn "
+  done < "$_file"
+
+  # 2. walk every manager that can enumerate itself, emitting undeclared top-level packages
+  local _mgr _n _src _desc _emitted=0 _skipped=0 _found=" "
+  local _wanted=" ${_names//,/ } "
+  for _mgr in "${PKGMAN_MANAGERS[@]:-}"; do
+    pkglib.common.can_list_installed "$_mgr" || continue
+    command -v "$(_pkglib.manager_tool "$_mgr")" >/dev/null 2>&1 || continue
+    while IFS=$'\t' read -r _n _src _desc || [[ -n "$_n" ]]; do
+      [[ -z "$_n" ]] && continue
+      if [[ "$_all" != "true" ]]; then
+        case "$_wanted" in *" $_n "*) ;; *) continue ;; esac
+      fi
+      _found="$_found$_n "
+      case "$_declared" in *" $_n "*) _skipped=$((_skipped + 1)); continue ;; esac
+      printf '%-14s | %-4s | %-30s | %-24s | %s\n' \
+        "$_n" "$_mgr" "${_desc:-$_n}" "${_src:+source=$_src}" "$_tags"
+      _emitted=$((_emitted + 1))
+    done < <("pkglib.$_mgr.list_installed" 2>/dev/null || true)
+  done
+
+  # 3. a requested name installed nowhere is almost certainly a typo - never fail silently
+  if [[ "$_all" != "true" ]]; then
+    local _w
+    for _w in ${_names//,/ }; do
+      [[ -z "$_w" ]] && continue
+      case "$_found" in *" $_w "*) ;; *) u.warn "not installed by any manager pkgman can enumerate: $_w" ;; esac
+    done
+  fi
+  # counters to stderr so stdout stays a clean, appendable stream of manifest rows
+  u.info "✓ adopt: $_emitted row(s) emitted, $_skipped already declared" >&2
   return 0
 }
 
@@ -2361,6 +2451,11 @@ COMMANDS:
                                         (a hold= param skips the row - upgrade it deliberately).
                                         --only=<csv> upgrades just those rows (targeted CVE response);
                                         naming a held row there overrides its hold
+    adopt <manifest> [<name>|<csv>] [--all] [--tags=<csv>]
+                                        REVERSE-SYNC: print manifest rows for installed TOP-LEVEL
+                                        packages the manifest does not declare (inverse of sync
+                                        --prune). Writes nothing - redirect or let a caller append.
+                                        Host-agnostic: dedupes against ALL declared rows.
     upgrade-deps <manifest> --host <h> [--only=<csv>]
                                         Upgrade the DEPENDENCY tier: software pulled in transitively by
                                         the manifest's managers, which a manifest never declares. Only
