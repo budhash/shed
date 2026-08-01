@@ -67,3 +67,15 @@ For a meaningful handoff, report:
 
 Do not describe unfinished, unverified, or aspirational behavior as complete. Codex review is
 advisory; the repository owner makes final product decisions.
+
+## Work tracking and session continuity
+
+GitHub Issues are the source of truth for planned and active work. At the start of a planning or
+implementation session, inspect the relevant issues with `gh issue list` and `gh issue view`.
+Issue #28 is the entry point for the 2026-08-01 architecture, quality, and security remediation
+program unless the owner selects another objective.
+
+Keep issue state honest, link implementation pull requests, and record durable decisions or
+follow-ups there. Audit documents provide rationale but do not establish current completion.
+Never close an issue solely because code was written; verify its acceptance criteria and required
+checks first.
