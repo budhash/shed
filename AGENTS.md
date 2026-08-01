@@ -35,14 +35,44 @@ historical evidence and rationale; do not infer current task status from their c
 At the start of a guardian or planning session:
 
 1. Read the relevant repository instructions and guardian charter.
-2. Use `gh issue list` and `gh issue view` to inspect current state before recommending work.
-3. Begin with issue #28 for the 2026-08-01 baseline remediation program unless the user names a
+2. Check the branch and working tree before drawing conclusions. Preserve user changes and do not
+   switch branches, stage files, or modify work during a read-only review.
+3. Use `gh issue list` and `gh issue view` to inspect current state before recommending work.
+4. Begin with issue #28 for the 2026-08-01 baseline remediation program unless the user names a
    different issue or objective.
-4. Treat issue descriptions and comments as context, not proof that implementation is correct or
+5. Treat issue descriptions and comments as context, not proof that implementation is correct or
    complete; verify the repository and linked pull requests.
 
 Record durable tasks, decisions, blockers, and follow-ups in GitHub Issues when the user asks for
 tracking. Do not rely on chat history for cross-session continuity.
+
+If GitHub is unavailable, report that live status could not be established. Do not substitute an
+audit checklist, local branch, cached issue description, or memory for current issue state. Safe
+local analysis may continue when it is useful, but label its status assumptions explicitly.
+
+For tracked work, keep the issue lifecycle accurate: record material decisions and blockers, link
+the implementation pull request, verify acceptance criteria and required checks, then close the
+issue or update the parent tracker only after completion. Do not create, edit, close, or comment on
+issues unless the user has authorized that external change.
+
+## Change delivery
+
+- Do not commit directly to `main`. When implementation is authorized, use a focused branch and a
+  pull request with the problem, scope, risks, compatibility impact, and verification performed.
+- Keep unrelated changes out of the branch and preserve pre-existing worktree modifications.
+- Treat passing CI as evidence, not proof of correctness. Apply the relevant guardian review
+  before recommending a merge.
+- Do not push, open or merge a pull request, delete a branch, publish a release, or otherwise
+  change remote state unless the user authorizes that action.
+- After an authorized merge, verify the pull request state and confirm that local `main` is clean
+  and synchronized with `origin/main`.
+
+## Safe inspection and reporting
+
+Inspect narrowly and avoid printing broad environment dumps, credential-bearing configuration,
+full Git identity metadata, or unredacted diagnostic logs. If sensitive or private information is
+encountered, do not reproduce it; identify only the minimum location needed for remediation and
+follow the guardian charter's disclosure guidance.
 
 ## Verification
 
