@@ -530,6 +530,13 @@ esac
 exit 0
 EOF
   chmod +x "$_fake/brew"
+  # HERMETIC: shadow every OTHER enumerable manager's tool with a silent no-op. Without this the suite
+  # inherits the host's real inventory — on the ubuntu CI lane `apt-mark showmanual` alone contributed
+  # 251 rows, and on macOS mas/npm/pipx did the same. Only the fake brew may produce rows here.
+  local _t
+  for _t in mas pipx npm apt-mark dnf; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$_fake/$_t"; chmod +x "$_fake/$_t"
+  done
 
   local _m; _m=$(mktemp "${TMPDIR:-/tmp}/adopt-XXXXXX")
   printf '# comment row\ndeclared-pkg | brew | already there | | mac\n' > "$_m"
