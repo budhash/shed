@@ -426,4 +426,45 @@ test_manifest_upgrade() {
   rm -f "$_mi" "$_mu"
 }
 
+test_manifest_upgrade_only() {
+  _section_header "P1: upgrade --only=<csv> (targeted CVE response; named row overrides its hold)"
+  setup_cfg
+  export MOCK_STATE; MOCK_STATE=$(mktemp -d "${TMPDIR:-/tmp}/mock-XXXXXX")
+
+  local _m; _m=$(mktemp "${TMPDIR:-/tmp}/only-XXXXXX")
+  printf 'one   | script | mock 1    | source=%s/mocks/mock-pkg!name=one              | \n' "$PWD" >  "$_m"
+  printf 'two   | script | mock 2    | source=%s/mocks/mock-pkg!name=two              | \n' "$PWD" >> "$_m"
+  printf 'held1 | script | mock held | source=%s/mocks/mock-pkg!name=held1!hold=coupled | \n' "$PWD" >> "$_m"
+  assert_ok $TOOL install "$_m" --host macmini "seed install (one, two, held1)"
+
+  # targeted: only 'one' is touched; 'two' is out of scope
+  local out; out=$($TOOL upgrade "$_m" --host macmini --only=one 2>&1)
+  assert_contains "$out" "mock updated one" "named row upgraded"
+  assert_eq 0 "$(printf '%s\n' "$out" | grep -c 'mock updated two' || true)" "unnamed row NOT touched (scoped)"
+  assert_contains "$out" "out of --only scope" "summary reports the out-of-scope count"
+
+  # csv form takes several; --only <v> (space form) parses too
+  out=$($TOOL upgrade "$_m" --host macmini --only=one,two 2>&1)
+  assert_contains "$out" "mock updated one" "csv: first name upgraded"
+  assert_contains "$out" "mock updated two" "csv: second name upgraded"
+  out=$($TOOL upgrade "$_m" --host macmini --only two 2>&1)
+  assert_contains "$out" "mock updated two" "space-separated --only <v> form parses"
+
+  # naming a HELD row overrides its hold (that IS the deliberate act a hold asks for)
+  out=$($TOOL upgrade "$_m" --host macmini --only=held1 2>&1)
+  assert_contains "$out" "explicitly named on --only" "held row named on --only is upgraded anyway"
+  assert_contains "$out" "mock updated held1" "held row actually upgraded when named"
+  # ...but an unscoped run still skips it
+  out=$($TOOL upgrade "$_m" --host macmini 2>&1)
+  assert_contains "$out" "upgrade deliberately (skipped)" "unscoped run still honors the hold"
+
+  # a typo'd name must warn, not silently no-op ("I patched it" when nothing happened is dangerous)
+  out=$($TOOL upgrade "$_m" --host macmini --only=nosuchpkg 2>&1)
+  assert_contains "$out" "matched no upgradable row" "unmatched --only warns loudly"
+  # --only requires a value
+  assert_fail $TOOL upgrade "$_m" --host macmini --only "--only with no value fails"
+
+  rm -f "$_m"
+}
+
 _test_runner
