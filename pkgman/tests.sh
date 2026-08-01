@@ -506,4 +506,69 @@ test_upgrade_deps() {
   rm -f "$_m2" "$_m3"
 }
 
+test_adopt() {
+  _section_header "P1: adopt — reverse-sync installed packages into manifest rows"
+  setup_cfg
+  # shellcheck disable=SC1091
+  source ./pkglib
+  # enumeration is an optional capability: artifact handlers cannot answer "what did you install?"
+  assert_ok pkglib.common.can_list_installed brew "brew can enumerate installed packages"
+  assert_ok pkglib.common.can_list_installed mas  "mas can enumerate"
+  for _m in github download dmg script cargo go; do
+    assert_fail pkglib.common.can_list_installed "$_m" "$_m cannot enumerate (no reliable inventory)"
+  done
+
+  # fake brew: 'leaves' (TOP-LEVEL only) is what adopt must consume - never the full formula list
+  local _fake; _fake=$(mktemp -d "${TMPDIR:-/tmp}/fakebin-XXXXXX")
+  cat > "$_fake/brew" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "leaves")           printf 'declared-pkg\nstray-pkg\n' ;;
+  "list --cask")      printf 'stray-cask\n' ;;
+  "list --formula")   printf 'declared-pkg\nstray-pkg\nsome-dependency\n' ;;
+esac
+exit 0
+EOF
+  chmod +x "$_fake/brew"
+  # HERMETIC: shadow every OTHER enumerable manager's tool with a silent no-op. Without this the suite
+  # inherits the host's real inventory — on the ubuntu CI lane `apt-mark showmanual` alone contributed
+  # 251 rows, and on macOS mas/npm/pipx did the same. Only the fake brew may produce rows here.
+  local _t
+  for _t in mas pipx npm apt-mark dnf; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$_fake/$_t"; chmod +x "$_fake/$_t"
+  done
+
+  local _m; _m=$(mktemp "${TMPDIR:-/tmp}/adopt-XXXXXX")
+  printf '# comment row\ndeclared-pkg | brew | already there | | mac\n' > "$_m"
+
+  local out; out=$(PATH="$_fake:/usr/bin:/bin" $TOOL adopt "$_m" --all 2>&1)
+  assert_contains "$out" "stray-pkg" "undeclared installed package is emitted"
+  assert_contains "$out" "stray-cask" "undeclared cask is emitted with its handler"
+  assert_eq 0 "$(printf '%s\n' "$out" | grep -c '^declared-pkg' || true)" "already-declared package is NOT re-emitted"
+  assert_eq 0 "$(printf '%s\n' "$out" | grep -c 'some-dependency' || true)" "DEPENDENCY not offered (only top-level: leaves, not list --formula)"
+  assert_contains "$out" "already declared" "summary reports the skipped count"
+  # emitted row is a valid manifest row: name|handler|desc|params|tags, and cask carries source=
+  assert_contains "$out" "| cask |" "cask row names the cask handler"
+  assert_contains "$out" "source=stray-cask" "cask row carries source="
+
+  # csv/single selection + --tags stamping
+  out=$(PATH="$_fake:/usr/bin:/bin" $TOOL adopt "$_m" stray-pkg --tags=mac,laptop 2>&1)
+  assert_contains "$out" "stray-pkg" "named package emitted"
+  assert_contains "$out" "mac,laptop" "--tags stamps the emitted row"
+  assert_eq 0 "$(printf '%s\n' "$out" | grep -c 'stray-cask' || true)" "unnamed package not emitted when a name is given"
+
+  # a name that is installed nowhere warns (typo guard), and no-args is a usage error
+  out=$(PATH="$_fake:/usr/bin:/bin" $TOOL adopt "$_m" nosuchthing 2>&1)
+  assert_contains "$out" "not installed by any manager" "unknown name warns rather than silently emitting nothing"
+  assert_fail env PATH="$_fake:$PATH" $TOOL adopt "$_m" "adopt with neither a name nor --all fails"
+  assert_fail $TOOL adopt not-a-file --all "adopt without a manifest fails"
+
+  # stdout must stay a clean appendable stream: counters go to stderr
+  local rows; rows=$(PATH="$_fake:/usr/bin:/bin" $TOOL adopt "$_m" --all 2>/dev/null)
+  assert_eq 0 "$(printf '%s\n' "$rows" | grep -c 'adopt:' || true)" "stdout carries only rows (summary is on stderr)"
+  assert_eq 2 "$(printf '%s\n' "$rows" | grep -c '|' || true)" "stdout is exactly the two undeclared rows"
+
+  rm -rf "$_fake"; rm -f "$_m"
+}
+
 _test_runner
