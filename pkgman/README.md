@@ -6,14 +6,29 @@ Universal package manager CLI with state tracking and manifest-driven installati
 
 `pkgman` is a stateful wrapper providing unified package management across brew, apt, dnf, cargo, go, npm, pipx, mas, github, download, script, cask, and dmg. It tracks package installations and versions in configuration files, reconciles system state with declarative manifests, and provides convenience commands for day-to-day package operations.
 
+**The manifest lifecycle is a closed loop**, with a verb for each direction:
+
+| verb | direction |
+|---|---|
+| `install` | declared → installed (add what's missing) |
+| `upgrade` | declared → current (bump versions; hold-aware, `--only` to target) |
+| `upgrade-deps` | the *dependency* tier — transitive packages a manifest never names |
+| `sync --prune` | installed → declared (evict what's undeclared) |
+| `adopt` | installed → declared, the other way (declare what's undeclared) |
+
+`sync --prune` and `adopt` are the same discovery ("installed but undeclared") with opposite resolutions; `upgrade` and `upgrade-deps` split on whether a package was *asked for* or *pulled in*.
+
 **This README documents the AS-BUILT implementation.** It supersedes archived design docs (`pkglib-design.md`, `testing-pkgman.md`), which referenced `packages.cfg` paths that are no longer current.
 
 ## Architecture
 
 pkgman is built in two layers:
 
-- **`pkgman`** (stateful CLI) — handles CLI parsing, state management, and manifest processing. Reads/writes configuration and status files. Implements `install`, `sync`, `add`, `remove`, `status`, `list`, `provision` commands.
+- **`pkgman`** (stateful CLI) — handles CLI parsing, state management, and manifest processing. Reads/writes configuration and status files. Implements `install`, `sync`, `upgrade`, `upgrade-deps`, `adopt`, `add`, `remove`, `status`, `list`, `provision` commands.
 - **`pkglib`** (stateless handlers) — provides package manager abstractions. Each manager (brew, apt, dnf, etc.) gets a set of operations (validate, install, update, uninstall, status) via `pkglib.<manager>.<operation>` functions. Called by pkgman with metadata and kwargs.
+  - **Optional capabilities** — beyond those five required operations, some managers implement extras that only make sense for them. A capability predicate gates each one, so a manager that lacks it reports an honest no-op instead of pretending; they are deliberately NOT required operations, since forcing all 13 handlers to implement them would be false symmetry:
+    - `pkglib.common.has_dep_tier <mgr>` + `pkglib.<mgr>.upgrade_deps` — a separate, independently-upgradable **dependency tier**. True for `brew`/`apt`/`dnf`. The language managers (`npm`/`pipx`/`cargo`/`go`) vendor deps *inside* the package, and `mas`/`cask`/`github`/`download`/`dmg`/`script` install self-contained artifacts.
+    - `pkglib.common.can_list_installed <mgr>` + `pkglib.<mgr>.list_installed` — **enumerate top-level installed packages** (used by `adopt`). True for `brew` (`leaves`), `cask`, `mas`, `pipx`, `npm`, `apt` (`showmanual`), `dnf` (`--userinstalled`). Not `github`/`download`/`dmg`/`script`/`cargo`/`go`, which place arbitrary artifacts with no reliable inventory.
 - **`pkgboot`** (bootstrap) — sourced by the script handler when provisioning script-based managers. Manages bootstrap script lookup and execution.
 
 ## Managers
@@ -101,12 +116,16 @@ name | handler | desc | params | tags
 | `name` | Package identifier | Must be a valid shell identifier |
 | `handler` | Manager type | One of the 13 managers above; unknown handlers warn+skip |
 | `desc` | Human description | Free text; for documentation only |
-| `params` | Key-value parameters | Format: `key=value!key2=value2!...` (`;` also accepted); passed to pkglib handlers as kwargs |
+| `params` | Key-value parameters | Format: `key=value!key2=value2!...` (`;` also accepted); passed to pkglib handlers as kwargs. Reserved pkgman-only keys are filtered out (never reach the handler) — see `hold` below |
 | `tags` | Filtering rules | Comma-separated: OS tags (mac, linux) and/or host tags (laptop, macmini, server); empty/untagged rows apply to all |
 
 **Params detail**: Parameters from the manifest become kwargs in pkglib handler calls. Special kwargs include standard metadata (`manager`, `source`, `dest`, `scope`, `tags`). Custom kwargs like `version=1.2.3` are ordinary parameters passed to the handler; pkgman never reads or validates them — they come from the caller (manifest or CLI).
 
 **Tags detail**: Tags filter which rows apply to the current operation. The `--host <hostname>` flag selects which host tags match. OS tags (mac, linux) auto-match based on the current system. Both must pass for a row to be included (i.e., tags are AND'd).
+
+**`hold=<reason>` (pkgman-only param)**: marks a row as *coupled* — a tool whose upgrade can break something that depends on it. `upgrade` SKIPS a held row and surfaces it (`held: <name> (<reason>)`); naming it explicitly on `--only` overrides the hold. The package stays fully declared, so `install` and `sync --prune` treat it normally. Any value except `false`/`no`/`0` means held. `hold` is in `PKGMAN_CORE_METADATA`, so it never leaks into a handler command.
+
+This is deliberately *not* a version pin: a hold means "upgrade deliberately, not in a bulk sweep" — it keeps the package patchable, whereas pinning would strand a possibly network-exposed tool on a vulnerable version.
 
 Example manifest:
 ```
@@ -115,6 +134,7 @@ docker    | brew    | container mgr | --cask                              | mac
 python    | brew    | python 3      |                                     | 
 rust      | cargo   | rust toolchain| --default-host x86_64-unknown-linux | linux
 app       | script  | custom app    | source=https://example.com/app.sh   | mac,laptop
+tmux-ish  | brew    | coupled tool  | hold=drives my scripts              | mac
 ```
 
 ## Commands
@@ -147,6 +167,49 @@ Reconcile system state with manifest. Installs missing, removes undeclared (with
 Example:
 ```bash
 pkgman sync ~/my-packages.manifest --host laptop --prune --force
+```
+
+### upgrade <manifest> --host <hostname> [--only=<csv>] [--dry-run]
+
+Version-upgrade every **installed**, tags-matching row via each handler's own `update` operation (`brew upgrade`, `brew upgrade --cask`, `mas upgrade`, `pipx upgrade`, `npm update -g`, re-fetch for `github`/`download`/`dmg`). Completes the triad: **install** (add) → **upgrade** (version) → **sync --prune** (remove).
+
+- **Manifest-scoped**: only DECLARED rows are touched — never other installed software (the same guarantee `--prune` gives).
+- **Hold-aware**: a row carrying `hold=<reason>` is skipped and surfaced (`held: <name> (<reason>) - upgrade deliberately`). See the `hold` param in Manifest Grammar.
+- `--only=<csv>`: upgrade just those rows — the targeted CVE response. **Naming a held row on `--only` overrides its hold** (naming it *is* the deliberate act the hold asks for). An `--only` that matches nothing WARNS rather than exiting 0 silently.
+- Rows that are not installed are skipped (that's an `install` job); unknown handlers warn and skip.
+- Exits nonzero iff an attempted upgrade failed (same automation contract as `install`).
+
+```bash
+pkgman upgrade ~/my-packages.manifest --host laptop
+pkgman upgrade ~/my-packages.manifest --host laptop --only=openssl,curl
+```
+
+### upgrade-deps <manifest> --host <hostname> [--only=<csv>] [--dry-run]
+
+Upgrade the **dependency tier** — software a manager pulled in transitively, which a manifest never names (a manifest declares top-level *intent*, not the resolved graph). `upgrade` is manifest-scoped and so structurally cannot reach these; in practice this tier is where most CVEs land.
+
+- Which managers are in play is derived **from the manifest** (the handlers its applicable rows use), so this stays declaration-driven rather than hardcoding a package manager.
+- Only managers with a real dependency tier act (`pkglib.common.has_dep_tier` → `brew`/`apt`/`dnf`); the rest report an honest no-op. See Optional Capabilities.
+- `--only=<csv>` names **dependency** packages (undeclared by definition), passed straight to the manager.
+- **NOT manifest-scoped**: a system package manager resolves its own graph, so related packages may be upgraded too. The command warns about this.
+
+```bash
+pkgman upgrade-deps ~/my-packages.manifest --host laptop
+pkgman upgrade-deps ~/my-packages.manifest --host laptop --only=openssl,ca-certificates
+```
+
+### adopt <manifest> [<name>|<csv>] [--all] [--tags=<csv>]
+
+**Reverse-sync**: print manifest rows for installed packages the manifest does NOT declare. The inverse of `sync --prune` — same discovery ("installed but undeclared"), opposite resolution: prune *evicts* the stray, adopt *declares* it.
+
+- Writes **nothing**: rows go to **stdout** (counters to stderr), so the stream is directly appendable. pkgman does not own a file it merely ingests — a caller that owns the manifest appends and diffs it.
+- **Top-level only** (`pkglib.<mgr>.list_installed`): a manifest declares intent, so the transitive dependency closure is never offered (on a real box, 71 `brew leaves` vs 275 formulae). Dependencies belong to `upgrade-deps`.
+- **No `--host`** — deliberately host-agnostic: dedupe runs against EVERY declared row regardless of tags (a row declared for another machine is still declared, and re-emitting it would duplicate), and the new rows' tags come from `--tags`.
+- A named package that is installed nowhere WARNS (typo guard). Requires a name/csv or `--all`.
+
+```bash
+pkgman adopt ~/my-packages.manifest ripgrep --tags=mac
+pkgman adopt ~/my-packages.manifest --all >> ~/my-packages.manifest
 ```
 
 ### add <handler> <name> [--key=value...]
